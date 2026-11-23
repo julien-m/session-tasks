@@ -1,5 +1,9 @@
 # Session Tasks
 
+<p align="center">
+  <img src="assets/session-tasks-preview.png" width="680" alt="Session Tasks with a compact task list and a detail pane using sample data">
+</p>
+
 Local Codex Desktop plugin. Node.js 22.18+, TypeScript, SQLite, native MCP App.
 
 The chat and panel share a persistent task queue. The panel displays the current instruction, with previous instructions and attachments in a separate history. A user edit invalidates the claim on the previous revision. Cancellation keeps the revision history and removes the item from the active queue.
