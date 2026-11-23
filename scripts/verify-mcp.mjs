@@ -106,12 +106,43 @@ try {
 	assert.equal(reopened.state, "queued");
 	assert.equal(reopened.verification, undefined);
 	assert.equal((await success("task_panel_list", {})).structuredContent.counts.done, 0);
-	await success("task_panel_cancel", { taskId, expectedSerial: reopened.serial });
+	const commentId = randomUUID();
+	const comment = { taskId, commentId, body: "I checked the fixture in the panel." };
+	const userComment = await success("task_panel_comment", comment);
+	assert.deepEqual(userComment.content, []);
+	assert.equal(userComment.structuredContent.author, "user");
+	assert.deepEqual(
+		(await success("task_panel_comment", comment)).structuredContent,
+		userComment.structuredContent,
+	);
+	const agentComment = await success("session_tasks_comment", {
+		taskId,
+		commentId: randomUUID(),
+		body: "Fixture verified through MCP.",
+	});
+	assert.equal(agentComment.structuredContent.author, "agent");
+	assert.deepEqual((await success("task_panel_comments", { taskId })).structuredContent.comments, [
+		userComment.structuredContent,
+		agentComment.structuredContent,
+	]);
+	assert.equal(
+		(await invoke("task_panel_comments", { scope: randomUUID(), taskId })).structuredContent.error,
+		"not_found",
+	);
+	assert.equal((await success("task_panel_get", { taskId })).structuredContent.serial, reopened.serial);
+	const observation = "I opened the fixture and saw the image in the detail panel.";
+	const manuallyDone = (
+		await success("task_panel_validate", { taskId, expectedSerial: reopened.serial, observation })
+	).structuredContent;
+	assert.equal(manuallyDone.manualValidation, observation);
+	assert.equal((await success("task_panel_list", { filter: "remaining" })).structuredContent.tasks.length, 0);
+	assert.equal((await success("task_panel_list", { filter: "done" })).structuredContent.tasks[0].id, taskId);
+	await success("task_panel_cancel", { taskId, expectedSerial: manuallyDone.serial });
 	assert.deepEqual(hook("Stop"), {});
 	assert.equal((await success("task_panel_list", {})).structuredContent.tasks.length, 0);
 	assert.equal((await success("task_panel_list", { cancelled: true })).structuredContent.tasks.length, 1);
 	console.log(
-		"Verified MCP discovery and icon, panel metadata, scope, hooks, attachment bytes, stale claim, history, completion evidence, reopening and cancellation.",
+		"Verified MCP discovery, hooks, attachments, history, completion evidence, reopening, scoped comments, manual validation, filters and cancellation.",
 	);
 } finally {
 	await client.close();

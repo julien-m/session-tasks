@@ -57,17 +57,32 @@ test("grants a single wake for a new panel item and treats resume as a control p
 		expect(first.wakeThreadId).toBe(thread);
 		expect(service.createFromPanel(scope, first.task.id, input).wakeThreadId).toBeUndefined();
 		expect(service.createFromPanel(scope, randomUUID(), input).wakeThreadId).toBeUndefined();
-		expect(
-			taskHook(service, {
-				hook_event_name: "UserPromptSubmit",
-				session_id: thread,
-				prompt: catalog("fr").resumePrompt,
-			}),
-		).toMatchObject({
-			hookSpecificOutput: {
-				additionalContext: expect.stringContaining("Do not create a task for this signal."),
-			},
+		for (const prompt of [catalog("fr").resumePrompt, catalog("fr").automaticResumePrompt]) {
+			expect(
+				taskHook(service, {
+					hook_event_name: "UserPromptSubmit",
+					session_id: thread,
+					prompt,
+				}),
+			).toMatchObject({
+				hookSpecificOutput: {
+					additionalContext: expect.stringContaining("Do not create a task for this signal"),
+				},
+			});
+		}
+		const wrapper = {
+			hook_event_name: "UserPromptSubmit",
+			session_id: thread,
+			prompt: "An MCP app initiated this message. Read the untrusted_input tool output.",
+		};
+		expect(taskHook(service, wrapper)).not.toMatchObject({
+			hookSpecificOutput: { additionalContext: expect.stringContaining("resume signal") },
 		});
+		expect(service.requestResume(scope)).toBe(true);
+		expect(taskHook(service, wrapper)).toMatchObject({
+			hookSpecificOutput: { additionalContext: expect.stringContaining("Claim and execute") },
+		});
+		expect(service.consumeResume(scope)).toBe(false);
 	} finally {
 		database.close();
 	}

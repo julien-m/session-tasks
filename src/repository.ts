@@ -3,20 +3,26 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { z } from "zod";
 import {
 	type Actor,
 	type Attachment,
+	type BoardFilter,
 	MAX_PAGE,
 	type Mode,
+	manualCheck,
 	type Revision,
 	type State,
 	type Task,
+	type TaskComment,
 	TaskError,
 	type TaskSummary,
 	type Verification,
 	verification,
 } from "./contract.ts";
 import { SCHEMA } from "./schema.ts";
+
+const storedManualCheck = z.object({ userCheck: manualCheck }).strict();
 
 function readVerification(stored: string | null): Verification | undefined {
 	if (!stored?.startsWith("{")) return undefined;
@@ -26,6 +32,32 @@ function readVerification(stored: string | null): Verification | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+function readManualValidation(stored: string | null): string | undefined {
+	if (!stored?.startsWith('{"userCheck":')) return undefined;
+	try {
+		const parsed = storedManualCheck.safeParse(JSON.parse(stored));
+		return parsed.success ? parsed.data.userCheck : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+const stateFilters = {
+	active: "t.state!='cancelled'",
+	all: "1=1",
+	remaining: "t.state IN ('queued','running','blocked')",
+	blocked: "t.state='blocked'",
+	done: "t.state='done'",
+	cancelled: "t.state='cancelled'",
+} satisfies Record<BoardFilter | "active", string>;
+const selectComment = "SELECT id,ordinal,author,kind,body,created_at AS createdAt FROM task_comment";
+
+export interface CommentsPage {
+	comments: TaskComment[];
+	next: number | null;
+	currentBlocker?: TaskComment;
 }
 
 interface TaskRow extends RevisionRow {
@@ -63,8 +95,10 @@ export interface BoardList {
 	counts: Record<State, number>;
 	next: number | null;
 }
-const SELECT_TASK = `SELECT t.*, r.title, r.body, r.mode, r.author, r.created_at
-FROM task t JOIN task_revision r ON r.task_id=t.id AND r.revision=t.revision`;
+const currentContent = `FROM task t JOIN task_revision r ON r.task_id=t.id AND r.revision=t.revision
+LEFT JOIN task_generated_title g ON g.task_id=r.task_id AND g.revision=r.revision`;
+const SELECT_TASK = `SELECT t.*, COALESCE(g.title,r.title) title, r.body, r.mode, r.author, r.created_at
+${currentContent}`;
 
 /** Opens a private SQLite database and initializes its schema. */
 export function openDatabase(path: string): DatabaseSync {
@@ -106,6 +140,22 @@ export class TaskRepository {
 	/** Verifies that a request names an existing board capability. */
 	assertScope(scope: string): void {
 		this.threadForScope(scope);
+	}
+
+	requestResume(scope: string, expiresAt: number): boolean {
+		const result = this.database
+			.prepare(`INSERT INTO board_resume(scope,expires_at)
+			SELECT ?,? WHERE EXISTS (SELECT 1 FROM task WHERE scope=? AND state='queued')
+			ON CONFLICT(scope) DO UPDATE SET expires_at=excluded.expires_at`)
+			.run(scope, expiresAt, scope);
+		return result.changes === 1;
+	}
+
+	consumeResume(scope: string, now: number): boolean {
+		const intent = this.database
+			.prepare("DELETE FROM board_resume WHERE scope=? RETURNING expires_at")
+			.get(scope);
+		return intent !== undefined && Number(intent.expires_at) >= now;
 	}
 
 	/** Resolves the owning chat without accepting a destination from the panel. */
@@ -161,6 +211,15 @@ export class TaskRepository {
 		for (const [position, id] of attachmentIds.entries()) link.run(taskId, revision.revision, position, id);
 	}
 
+	/** Adds a generated title only while the original task instructions are current. */
+	saveGeneratedTitle(scope: string, taskId: string, title: string): void {
+		this.database
+			.prepare(`INSERT INTO task_generated_title (task_id,revision,title)
+			SELECT id,revision,? FROM task WHERE scope=? AND id=? AND revision=1 AND state!='cancelled'
+			ON CONFLICT(task_id,revision) DO NOTHING`)
+			.run(title, scope, taskId);
+	}
+
 	/** Advances the current snapshot and operational state of a task. */
 	update(
 		scope: string,
@@ -185,6 +244,8 @@ export class TaskRepository {
 				current.serial,
 			);
 		if (result.changes !== 1) throw new TaskError("conflict");
+		if (current.state === "blocked" && current.receipt)
+			this.addComment(taskId, randomUUID(), "agent", "blocker", current.receipt, current.updated_at);
 	}
 
 	/** Maps a stored revision and its attachment metadata without reading file bytes. */
@@ -208,6 +269,9 @@ export class TaskRepository {
 	/** Maps a stored task to its current state. Claim tokens are never part of the view. */
 	task(row: TaskRow): Task {
 		const proof = row.state === "done" ? readVerification(row.receipt) : undefined;
+		const legacyManual = row.state === "done" ? readManualValidation(row.receipt) : undefined;
+		const manual =
+			row.state === "done" ? (this.userValidation(row.id, row.serial) ?? legacyManual) : undefined;
 		return {
 			...this.revision(row.id, row),
 			id: row.id,
@@ -215,21 +279,41 @@ export class TaskRepository {
 			serial: row.serial,
 			state: row.state,
 			assignee: row.assignee,
-			receipt: proof ? [proof.work, proof.check, proof.result, proof.evidence].join("\n") : row.receipt,
+			receipt: proof
+				? [proof.work, proof.check, proof.result, proof.evidence].join("\n")
+				: (legacyManual ?? row.receipt),
 			...(proof ? { verification: proof } : {}),
+			...(manual ? { manualValidation: manual } : {}),
 			updatedAt: row.updated_at,
 		};
 	}
 
+	userValidation(taskId: string, serial: number): string | undefined {
+		const row = this.database
+			.prepare("SELECT observation FROM task_validation WHERE task_id=? AND serial=?")
+			.get(taskId, serial);
+		return row?.observation as string | undefined;
+	}
+
+	saveUserValidation(taskId: string, serial: number, observation: string): void {
+		this.database.prepare("INSERT INTO task_validation VALUES (?,?,?)").run(taskId, serial, observation);
+	}
+
 	/** Reads a keyset page and per-board state counts. */
-	list(scope: string, after: number, cancelled: boolean): BoardList {
-		const filter = cancelled ? "t.state='cancelled'" : "t.state!='cancelled'";
+	list(scope: string, after: number, filter: BoardFilter | "active" | BoardFilter[]): BoardList {
+		const condition = Array.isArray(filter)
+			? filter.length
+				? filter
+						.map((state) => (state === "remaining" ? "t.state IN ('queued','running')" : stateFilters[state]))
+						.join(" OR ")
+				: stateFilters.all
+			: stateFilters[filter];
 		const rows = this.database
-			.prepare(`SELECT t.id,t.ordinal,t.serial,t.revision,r.title,r.mode,t.state,t.assignee,
+			.prepare(`SELECT t.id,t.ordinal,t.serial,t.revision,COALESCE(g.title,r.title) title,r.mode,t.state,t.assignee,
 			CASE WHEN t.state='blocked' THEN substr(t.receipt,1,160) END blockedReason,
 			(SELECT count(*) FROM revision_attachment a WHERE a.task_id=t.id AND a.revision=t.revision) attachmentCount
-			FROM task t JOIN task_revision r ON r.task_id=t.id AND r.revision=t.revision
-			WHERE t.scope=? AND t.ordinal>? AND ${filter} ORDER BY t.ordinal LIMIT ?`)
+			${currentContent}
+			WHERE t.scope=? AND t.ordinal>? AND (${condition}) ORDER BY t.ordinal LIMIT ?`)
 			.all(scope, after, MAX_PAGE + 1) as unknown as TaskSummary[];
 		const counts: Record<State, number> = { queued: 0, running: 0, blocked: 0, done: 0, cancelled: 0 };
 		for (const row of this.database
@@ -238,6 +322,37 @@ export class TaskRepository {
 			counts[row.state as State] = Number(row.count);
 		const tasks = rows.slice(0, MAX_PAGE);
 		return { tasks, counts, next: rows.length > MAX_PAGE ? (tasks.at(-1)?.ordinal ?? null) : null };
+	}
+
+	addComment(
+		taskId: string,
+		commentId: string,
+		author: Actor,
+		kind: TaskComment["kind"],
+		body: string,
+		now: number,
+	): TaskComment {
+		this.database
+			.prepare(`INSERT INTO task_comment (task_id,id,author,kind,body,created_at)
+			VALUES (?,?,?,?,?,?) ON CONFLICT(task_id,id) DO NOTHING`)
+			.run(taskId, commentId, author, kind, body, now);
+		const comment = this.database
+			.prepare(`${selectComment} WHERE task_id=? AND id=?`)
+			.get(taskId, commentId) as unknown as TaskComment;
+		if (comment.author !== author || comment.kind !== kind || comment.body !== body)
+			throw new TaskError("conflict");
+		return comment;
+	}
+
+	comments(taskId: string, before: number): CommentsPage {
+		const rows = this.database
+			.prepare(`${selectComment} WHERE task_id=? AND ordinal<? ORDER BY ordinal DESC LIMIT ?`)
+			.all(taskId, before, MAX_PAGE + 1) as unknown as TaskComment[];
+		const comments = rows.slice(0, MAX_PAGE);
+		return {
+			comments: comments.reverse(),
+			next: rows.length > MAX_PAGE ? (comments[0]?.ordinal ?? null) : null,
+		};
 	}
 
 	/** Reads an immutable revision page in reverse chronological order. */

@@ -31,15 +31,21 @@ export function taskHook(service: TaskService, input: unknown): object {
 			reason: `Session Tasks scope=${scope}. Recheck the board once. Continue pending user-authorized work where possible and record concrete blockers. Respect cancellation and do not restart workers whose status is uncertain.`,
 		};
 	}
-	const resuming = event.prompt === catalog("en").resumePrompt || event.prompt === catalog("fr").resumePrompt;
+	const exactResume = [catalog("en"), catalog("fr")].some(
+		({ resumePrompt, automaticResumePrompt }) =>
+			event.prompt === resumePrompt || event.prompt === automaticResumePrompt,
+	);
+	const appWrapper = event.prompt?.startsWith("An MCP app initiated this message.") ?? false;
+	const verifiedRequest = (exactResume || appWrapper) && service.consumeResume(scope);
+	const resuming = exactResume || verifiedRequest;
 	return {
 		hookSpecificOutput: {
 			hookEventName: event.hook_event_name,
 			additionalContext: [
 				`Session Tasks board scope=${scope}. This is the exact board for the current chat. ${workLeft} queued or claimed task(s).`,
 				resuming
-					? "This is a Session Tasks resume signal. Read and process the existing queued tasks. Do not create a task for this signal."
-					: "For a new actionable request, record each distinct user-requested outcome with session_tasks_add and invoke open_session_tasks once when starting the board or when requested. Use the actual scope. Update existing tasks in place when revising them. Leave questions and casual conversation alone.",
+					? "This is a Session Tasks resume signal. Now read the queue for the scope above. Claim and execute the existing user-authorized queued tasks where permitted. Do not create a task for this signal or stop after announcing the queue."
+					: "Before starting any actionable request in this chat, register each distinct requested outcome on this board with session_tasks_add, or update the matching task when revising an existing request. This applies to follow-ups and requests added while another task is in progress. Use the exact scope above. Open the panel once when starting the board or when requested. Leave purely informational questions and casual conversation alone.",
 				"This installed workflow delegates independent tasks to subagents by default when allowed and available. Keep mode=thread tasks in the parent chat. Parallelize only isolated changes; claim one revision per executor, pass its own instructions and attachments only, and verify the result in the parent before settling.",
 				"Never mark a task done before an actual check passes. Record the work performed, check executed, observed result, and inspectable evidence on the task. If verification fails or cannot run, record the exact blocker.",
 				"Check session_tasks_list after each task and once before ending. New panel entries arrive in the queue. Follow edits and cancellations; an old claim cannot complete a revised task. Track scoped user work only and settle with evidence or a concrete blocker.",

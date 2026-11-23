@@ -16,9 +16,20 @@ import {
 	type TransferredContext,
 	validateFiles,
 } from "./context-transfer.ts";
-import { type Attachment, id, MAX_PAGE, type Revision, type Task, type TaskSummary } from "./contract.ts";
+import {
+	type Attachment,
+	type BoardFilter,
+	commentBody,
+	id,
+	MAX_PAGE,
+	manualCheck,
+	type Revision,
+	type Task,
+	type TaskComment,
+	type TaskSummary,
+} from "./contract.ts";
 import { catalog } from "./messages.ts";
-import type { BoardList } from "./repository.ts";
+import type { BoardList, CommentsPage } from "./repository.ts";
 
 const locale = /^fr(?:-|$)/i.test(navigator.language) ? "fr" : "en";
 const t = catalog(locale);
@@ -68,11 +79,14 @@ async function call<T>(name: string, args: Record<string, unknown> = {}): Promis
 	return response.structuredContent as T;
 }
 
-async function createTask(command: Record<string, unknown>): Promise<Task> {
+async function createTask(
+	command: Record<string, unknown>,
+	deferWake = false,
+): Promise<Task & { wake?: boolean }> {
 	const board = scope;
 	const saved = await call<Task & { wake?: boolean }>("create", command);
-	if (scope === board && saved.wake && app.getHostCapabilities()?.message?.text) {
-		void resumeChat();
+	if (!deferWake && scope === board && saved.wake && app.getHostCapabilities()?.message?.text) {
+		void resumeChat(true);
 	}
 	return saved;
 }
@@ -92,6 +106,9 @@ transferNotice.setAttribute("role", "status");
 const dropZone = element("p", t.dropHere, "drop-zone");
 main.tabIndex = 0;
 const dialog = element("dialog");
+dialog.addEventListener("cancel", (event) => {
+	if (mutation) event.preventDefault();
+});
 dialog.setAttribute("aria-labelledby", "task-dialog-title");
 const dialogContent = element("div", undefined, "dialog-content");
 dialog.append(dialogContent);
@@ -128,7 +145,7 @@ quickAdd.onsubmit = async (event) => {
 		quickPending = undefined;
 		if (scope !== board) return;
 		if (quickTitle.value === draft) quickTitle.value = "";
-		if (showCancelled) switchList(false);
+		if (selectedFilters.length && !selectedFilters.includes("remaining")) switchList(["remaining"]);
 		else await refresh(true);
 	} catch {
 		notice.textContent = t.error;
@@ -137,10 +154,33 @@ quickAdd.onsubmit = async (event) => {
 		finishMutation();
 	}
 };
-const active = button(t.active, () => switchList(false));
-const cancelled = button(t.cancelled, () => switchList(true));
-active.disabled = true;
-cancelled.disabled = true;
+const filters = element("div", undefined, "filter-buttons");
+filters.setAttribute("role", "group");
+filters.setAttribute("aria-label", t.filter);
+const choices = {
+	remaining: t.remaining,
+	blocked: t.blockedFilter,
+	done: t.doneFilter,
+};
+const filterButtons = Object.entries(choices).map(([key, label]) => {
+	const value = key as keyof typeof choices;
+	const toggle = button(label, () =>
+		switchList(
+			selectedFilters.includes(value)
+				? selectedFilters.filter((filter) => filter !== value)
+				: [...selectedFilters.filter((filter) => filter !== "cancelled"), value],
+		),
+	);
+	toggle.disabled = true;
+	toggle.setAttribute("aria-pressed", "false");
+	filters.append(toggle);
+	return { value, toggle };
+});
+const cancelledFilter = button(t.cancelled, () =>
+	switchList(selectedFilters.includes("cancelled") ? [] : ["cancelled"]),
+);
+cancelledFilter.hidden = true;
+cancelledFilter.setAttribute("aria-pressed", "false");
 const more = button(t.more, () => {
 	if (next === null) return;
 	pageHistory.push(cursor);
@@ -156,29 +196,28 @@ previous.hidden = true;
 const resume = button(t.resume, () => void resumeChat());
 resume.hidden = true;
 const pageNavigation = group(previous, more);
-const filters = group(active, cancelled, resume);
-filters.classList.add("board-filters");
+const filterBar = group(filters, cancelledFilter, resume);
+filterBar.classList.add("board-filters");
 const heading = group(group(element("h1", t.heading), progressText), add);
 heading.classList.add("heading");
-main.append(
-	heading,
-	progressGroup,
-	quickAdd,
-	transferNotice,
-	notice,
-	rows,
-	filters,
-	dropZone,
-	pageNavigation,
-);
+const boardHeader = element("header", undefined, "board-header");
+boardHeader.append(heading, progressGroup, quickAdd);
+const boardList = element("div", undefined, "board-list");
+boardList.append(transferNotice, notice, rows, dropZone);
+const boardFooter = element("footer", undefined, "board-footer");
+boardFooter.append(filterBar, pageNavigation, element("small", `v${manifest.version}`, "meta"));
+main.append(boardHeader, boardList, boardFooter);
 document.documentElement.lang = locale;
 document.body.append(main, dialog);
 
-let showCancelled = false;
+let selectedFilters: BoardFilter[] = [];
+let refreshDiscussion: (() => Promise<void>) | undefined;
 let next: number | null = null;
 let cursor = 0;
 const pageHistory: number[] = [];
-let current: TaskSummary[] = [];
+type PanelTask = TaskSummary & { titlePending?: boolean };
+type PanelBoardList = Omit<BoardList, "tasks"> & { tasks: PanelTask[] };
+let current: PanelTask[] = [];
 let refreshGeneration = 0;
 let refreshing = false;
 let mutation = false;
@@ -191,16 +230,18 @@ function finishMutation(): void {
 }
 let lastRender = "";
 
-function switchList(value: boolean): void {
-	showCancelled = value;
-	active.setAttribute("aria-pressed", String(!value));
-	cancelled.setAttribute("aria-pressed", String(value));
+function switchList(values: BoardFilter[]): Promise<void> {
+	selectedFilters = values;
+	for (const { value, toggle } of filterButtons)
+		toggle.setAttribute("aria-pressed", String(values.includes(value)));
+	cancelledFilter.setAttribute("aria-pressed", String(values.includes("cancelled")));
 	cursor = 0;
 	pageHistory.length = 0;
-	resetPage();
+	return resetPage();
 }
 
-function resetPage(): void {
+function resetPage(): Promise<void> {
+	boardList.scrollTop = 0;
 	current = [];
 	next = null;
 	lastRender = "";
@@ -208,15 +249,21 @@ function resetPage(): void {
 	more.hidden = true;
 	previous.hidden = pageHistory.length === 0;
 	notice.textContent = t.loading;
-	void refresh(true);
+	return refresh(true);
 }
 
-async function resumeChat(): Promise<void> {
+async function resumeChat(automatic = false): Promise<void> {
 	if (resume.disabled) return;
 	resume.disabled = true;
 	try {
+		const board = scope;
+		const request = await call<{ requested: boolean }>("request_resume");
+		if (!request.requested || scope !== board) return;
 		const response = await app.sendMessage(
-			{ role: "user", content: [{ type: "text", text: t.resumePrompt }] },
+			{
+				role: "user",
+				content: [{ type: "text", text: automatic ? t.automaticResumePrompt : t.resumePrompt }],
+			},
 			{ timeout: 10000, maxTotalTimeout: 10000 },
 		);
 		if (response.isError) throw new Error("host_rejected");
@@ -232,7 +279,7 @@ async function refresh(force = false): Promise<void> {
 	refreshing = true;
 	const generation = ++refreshGeneration;
 	try {
-		const page = await call<BoardList>("list", { after: cursor, cancelled: showCancelled });
+		const page = await call<PanelBoardList>("list", { after: cursor, filters: selectedFilters });
 		if (generation !== refreshGeneration) return;
 		current = page.tasks;
 		next = page.next;
@@ -244,6 +291,23 @@ async function refresh(force = false): Promise<void> {
 	}
 }
 
+async function revealCreatedTask(task: Task): Promise<void> {
+	const loading =
+		selectedFilters.length && !selectedFilters.includes("remaining")
+			? switchList(["remaining"])
+			: refresh(true);
+	const generation = refreshGeneration;
+	await loading;
+	if (generation !== refreshGeneration || dialog.open) return;
+	const last = current.at(-1);
+	if (next !== null && last && last.ordinal < task.ordinal) {
+		pageHistory.push(cursor);
+		cursor = task.ordinal - 1;
+		await resetPage();
+	}
+	rows.querySelector(`[data-task-id="${task.id}"]`)?.scrollIntoView({ block: "nearest" });
+}
+
 function render(counts: BoardList["counts"]): void {
 	const total = counts.queued + counts.running + counts.blocked + counts.done;
 	progressGroup.hidden = total === 0;
@@ -253,8 +317,17 @@ function render(counts: BoardList["counts"]): void {
 	progressText.setAttribute("aria-label", t.completed({ done: counts.done, total }));
 	more.hidden = next === null;
 	resume.hidden = counts.queued === 0 || !app.getHostCapabilities()?.message?.text;
-	notice.textContent = current.length ? "" : showCancelled ? t.emptyCancelled : t.empty;
-	const signature = JSON.stringify(current.map(({ id, serial }) => [id, serial]));
+	cancelledFilter.hidden = counts.cancelled === 0;
+	notice.textContent = current.length
+		? ""
+		: selectedFilters.length === 0
+			? t.empty
+			: selectedFilters.length === 1 && selectedFilters[0] === "cancelled"
+				? t.emptyCancelled
+				: t.emptyFilter;
+	const signature = JSON.stringify(
+		current.map(({ id, serial, title, titlePending }) => [id, serial, title, titlePending]),
+	);
 	if (signature === lastRender) return;
 	lastRender = signature;
 	const focusedTask = rows.contains(document.activeElement) ? dropTaskId(document.activeElement) : undefined;
@@ -265,7 +338,7 @@ function render(counts: BoardList["counts"]): void {
 			?.focus({ preventScroll: true });
 }
 
-function renderTask(task: TaskSummary): HTMLLIElement {
+function renderTask(task: PanelTask): HTMLLIElement {
 	const row = element("li", undefined, "task");
 	row.dataset.testid = `task-row-${task.id}`;
 	row.dataset.taskId = task.id;
@@ -292,7 +365,13 @@ function renderTask(task: TaskSummary): HTMLLIElement {
 	summary.append(line);
 	const metadata = group(element("span", label, "task-state"));
 	metadata.classList.add("task-meta");
-	const executor = task.assignee === "thread" || !task.assignee ? "" : task.assignee;
+	if (task.titlePending) {
+		const pending = element("span", t.titlePending, "meta");
+		pending.id = `pending-title-${task.id}`;
+		title.setAttribute("aria-describedby", pending.id);
+		metadata.append(pending);
+	}
+	const executor = task.assignee === "thread" || task.assignee === "user" ? null : task.assignee;
 	metadata.append(element("span", executor ? `${t[task.mode]} → ${executor}` : t[task.mode], "execution"));
 	if (task.attachmentCount) {
 		const files = element("span", `📎︎ ${task.attachmentCount}`);
@@ -313,6 +392,7 @@ function renderTask(task: TaskSummary): HTMLLIElement {
 }
 
 function dialogHeader(title: string, fullPane = false): void {
+	refreshDiscussion = undefined;
 	dialog.dataset.layout = fullPane ? "pane" : "dialog";
 	dialogContent.ondragover = null;
 	dialogContent.ondragleave = null;
@@ -321,9 +401,19 @@ function dialogHeader(title: string, fullPane = false): void {
 	dialogContent.classList.remove("drop-armed");
 	const heading = element("h2", title);
 	heading.id = "task-dialog-title";
-	const back = button("‹", () => dialog.close(), "icon-button back");
+	const back = button(
+		fullPane ? `‹ ${t.heading}` : "‹",
+		() => {
+			if (!mutation) dialog.close();
+		},
+		"icon-button back",
+	);
 	back.setAttribute("aria-label", t.close);
-	dialogContent.replaceChildren(group(back, heading));
+	if (fullPane) {
+		const header = element("header", undefined, "task-detail-header");
+		header.append(back, heading);
+		dialogContent.replaceChildren(header);
+	} else dialogContent.replaceChildren(group(back, heading));
 	if (!dialog.open) dialog.showModal();
 }
 
@@ -341,27 +431,56 @@ async function fetchDetails(taskId: string, edit = false): Promise<void> {
 	}
 }
 
-function showDetails(task: Task): void {
+interface DiscussionDraft {
+	text: string;
+	focused: boolean;
+	pending: { body: string; id: string } | undefined;
+}
+
+function showDetails(task: Task, draft?: DiscussionDraft): void {
 	dialogHeader(task.title, true);
+	let readDiscussionDraft: (() => DiscussionDraft) | undefined;
 	const detailsState = element(
 		"p",
 		t[task.state === "cancelled" ? "cancelledState" : task.state],
 		"detail-state",
 	);
 	detailsState.dataset.state = task.state;
-	dialogContent.append(detailsState);
-	const executor = task.assignee === "thread" || !task.assignee ? "" : task.assignee;
-	const execution = group(
-		element("span", t.delegation),
-		element("span", executor ? `${t[task.mode]} → ${executor}` : t[task.mode], "execution"),
+	const executor = task.assignee === "thread" || task.manualValidation ? null : task.assignee;
+	const metadata = group(
+		detailsState,
+		element("span", executor ? `${t[task.mode]} → ${executor}` : t[task.mode], "meta"),
 	);
-	execution.classList.add("task-meta");
-	dialogContent.append(execution);
+	metadata.classList.add("detail-metadata");
+	dialogContent.firstElementChild?.append(metadata);
+	const mainActions = group();
+	mainActions.classList.add("detail-primary-actions");
+	if (
+		task.state === "queued" ||
+		task.state === "blocked" ||
+		(task.state === "done" && !task.manualValidation)
+	)
+		mainActions.append(
+			button(t.validate, () => showValidation(task, readDiscussionDraft?.()), "detail-validate"),
+		);
+	if (task.state === "blocked")
+		mainActions.append(button(t.resolveBlocker, () => void updateTask("restore", task)));
+	if (mainActions.childElementCount) dialogContent.append(mainActions);
 	if (task.body || task.attachments.length) {
-		dialogContent.append(element("h3", t.currentVersion), renderRevision(task, task, false));
+		const context = element("details", undefined, "detail-context");
+		context.open = task.state !== "done";
+		context.append(element("summary", t.currentVersion), renderRevision(task, task, false));
+		dialogContent.append(context);
 	}
-	if (task.receipt && !task.verification) dialogContent.append(element("p", task.receipt, "notice"));
+	if (task.receipt && task.state === "done" && !task.verification && task.receipt !== task.manualValidation)
+		dialogContent.append(element("p", task.receipt, "notice"));
+	if (task.manualValidation) {
+		const check = element("section", undefined, "detail-approval");
+		check.append(element("h3", t.validatedByYou), element("p", task.manualValidation, "comment-body"));
+		dialogContent.append(check);
+	}
 	if (task.verification) {
+		const checks = element("section", undefined, "detail-checks");
 		const proof = element("dl", undefined, "verification");
 		for (const [label, value] of [
 			[t.workPerformed, task.verification.work],
@@ -371,7 +490,8 @@ function showDetails(task: Task): void {
 		] as const) {
 			proof.append(element("dt", label), element("dd", value));
 		}
-		dialogContent.append(proof);
+		checks.append(element("h3", t.codexVerification), proof);
+		dialogContent.append(checks);
 	}
 	const history = element("div", undefined, "stack revision-history");
 	history.id = "task-revision-history";
@@ -384,8 +504,8 @@ function showDetails(task: Task): void {
 	historyToggle.setAttribute("aria-expanded", "false");
 	historyToggle.setAttribute("aria-controls", history.id);
 	const actions = group(historyToggle);
-	if (task.state === "cancelled" || task.state === "blocked")
-		actions.append(button(t.restore, () => void updateTask("restore", task)));
+	actions.classList.add("detail-secondary-actions");
+	if (task.state === "cancelled") actions.append(button(t.restore, () => void updateTask("restore", task)));
 	if (task.state === "done") actions.append(button(t.reopen, () => void updateTask("restore", task)));
 	if (task.state === "running") actions.append(button(t.recover, () => confirmRecovery(task)));
 	if (task.state !== "cancelled")
@@ -398,6 +518,7 @@ function showDetails(task: Task): void {
 		dialogContent.append(hint);
 		installDropSurface(dialogContent, (context) => void saveDroppedContext(context, task.id, true));
 		dialogContent.onpaste = (event) => {
+			if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
 			if (!event.clipboardData || !acceptsContext(event.clipboardData)) return;
 			event.preventDefault();
 			const context = captureContext(event.clipboardData);
@@ -405,6 +526,7 @@ function showDetails(task: Task): void {
 		};
 	}
 	dialogContent.append(actions, history);
+	readDiscussionDraft = showDiscussion(task, draft);
 }
 
 function confirmRecovery(task: Task): void {
@@ -418,12 +540,226 @@ function confirmRecovery(task: Task): void {
 	);
 }
 
+function showValidation(task: Task, draft?: DiscussionDraft): void {
+	dialogHeader(task.title, true);
+	const form = element("form", undefined, "detail-validation-form");
+	form.setAttribute("aria-labelledby", "task-dialog-title");
+	const observation = element("textarea");
+	observation.required = true;
+	observation.maxLength = 1200;
+	const confirm = element("button", t.confirmValidation, "detail-validate");
+	confirm.type = "submit";
+	const feedback = element("p", undefined, "notice");
+	feedback.setAttribute("role", "status");
+	const validationEvents = new AbortController();
+	function returnToDetail(updated: Task): void {
+		validationEvents.abort();
+		showDetails(updated, draft);
+		const heading = dialogContent.querySelector("h2");
+		if (!draft?.focused && heading) {
+			heading.tabIndex = -1;
+			heading.focus();
+		}
+	}
+	function cancelValidation(event: Event): void {
+		if (!form.isConnected) return;
+		event.preventDefault();
+		if (!mutation) returnToDetail(task);
+	}
+	dialog.addEventListener("cancel", cancelValidation, { signal: validationEvents.signal });
+	dialog.addEventListener("close", () => validationEvents.abort(), {
+		once: true,
+		signal: validationEvents.signal,
+	});
+	form.append(element("h3", t.validate));
+	if (task.verification)
+		form.append(element("p", `${t.checkPerformed} · ${task.verification.check}`, "meta"));
+	form.append(
+		field(t.manualCheck, observation),
+		group(
+			confirm,
+			button(t.backToDetail, () => {
+				if (!mutation) returnToDetail(task);
+			}),
+		),
+		feedback,
+	);
+	form.onsubmit = async (event) => {
+		event.preventDefault();
+		if (mutation) return;
+		const proof = manualCheck.safeParse(observation.value.trim());
+		if (!proof.success) {
+			feedback.textContent = t.manualCheck;
+			observation.focus();
+			return;
+		}
+		mutation = true;
+		confirm.disabled = true;
+		try {
+			const updated = await call<Task>("validate", {
+				taskId: task.id,
+				expectedSerial: task.serial,
+				observation: proof.data,
+			});
+			if (dialog.open && form.isConnected) {
+				if (draft?.text.trim() || draft?.pending) returnToDetail(updated);
+				else {
+					validationEvents.abort();
+					dialog.close();
+					transferMessage(t.taskValidated);
+				}
+			}
+			void refresh(true);
+		} catch (error) {
+			feedback.textContent = error instanceof Error && error.message === "conflict" ? t.unsigned : t.error;
+		} finally {
+			confirm.disabled = false;
+			finishMutation();
+		}
+	};
+	dialogContent.append(form);
+	observation.focus();
+}
+
+function showDiscussion(task: Task, savedDraft?: DiscussionDraft): () => DiscussionDraft {
+	const section = element("section", undefined, "task-discussion");
+	const list = element("ol", undefined, "comment-list");
+	const form = element("form");
+	const input = element("textarea");
+	input.required = true;
+	input.maxLength = 8192;
+	input.value = savedDraft?.text ?? "";
+	const post = element("button", t.postComment, "detail-publish");
+	post.type = "submit";
+	const feedback = element("p", undefined, "notice");
+	feedback.setAttribute("role", "status");
+	const readError = element("p", undefined, "notice");
+	readError.setAttribute("role", "status");
+	const older = button(t.olderComments, () => {
+		if (cursor) void load(cursor);
+	});
+	older.hidden = true;
+	const stored = new Map<number, TaskComment>();
+	let cursor: number | null = null;
+	let loading = false;
+	let loaded = false;
+	let latestOrdinal: number | undefined;
+	let draft = savedDraft?.pending;
+	let blocker: TaskComment | undefined;
+	function renderComments(): void {
+		const entries = [...stored.values(), ...(blocker ? [blocker] : [])].sort(
+			(a, b) => a.createdAt - b.createdAt || a.ordinal - b.ordinal,
+		);
+		list.replaceChildren(
+			...entries.map((comment) => {
+				const item = element("li", undefined, "task-comment");
+				item.dataset.author = comment.author;
+				const timestamp = element("time", dateFormat.format(comment.createdAt), "meta");
+				timestamp.dateTime = new Date(comment.createdAt).toISOString();
+				const label = comment.kind === "blocker" ? `${t.agent} · ${t.blocked}` : t[comment.author];
+				const avatar = element("span", t[comment.author].slice(0, 1), "comment-avatar");
+				avatar.setAttribute("aria-hidden", "true");
+				const message = element("div", undefined, "comment-message");
+				message.append(
+					group(element("strong", label), timestamp),
+					element("p", comment.body, "comment-body"),
+				);
+				item.append(avatar, message);
+				return item;
+			}),
+		);
+	}
+	async function load(before?: number): Promise<void> {
+		if (loading || !section.isConnected) return;
+		loading = true;
+		try {
+			const page = await call<CommentsPage & { taskSerial: number }>("comments", { taskId: task.id, before });
+			if (page.taskSerial !== task.serial && !post.disabled) {
+				const updated = await call<Task>("get", { taskId: task.id });
+				if (!dialog.open || !section.isConnected) return;
+				const scroll = dialog.scrollTop;
+				showDetails(updated, {
+					text: input.value,
+					focused: document.activeElement === input,
+					pending: draft,
+				});
+				dialog.scrollTop = scroll;
+				return;
+			}
+			const activeBlocker = page.taskSerial === task.serial ? page.currentBlocker : blocker;
+			let changed = activeBlocker?.createdAt !== blocker?.createdAt || activeBlocker?.body !== blocker?.body;
+			blocker = activeBlocker;
+			if (before === undefined) {
+				const missedPage =
+					page.next !== null && !page.comments.some((comment) => comment.ordinal === latestOrdinal);
+				latestOrdinal = page.comments.at(-1)?.ordinal;
+				if (missedPage) {
+					for (const ordinal of stored.keys()) {
+						if (latestOrdinal !== undefined && ordinal <= latestOrdinal) stored.delete(ordinal);
+					}
+					changed = true;
+				}
+				if (!loaded || missedPage) cursor = page.next;
+			} else cursor = page.next;
+			for (const comment of page.comments) {
+				if (!stored.has(comment.ordinal)) changed = true;
+				stored.set(comment.ordinal, comment);
+			}
+			loaded = true;
+			older.hidden = !cursor;
+			if (changed) renderComments();
+			readError.textContent = "";
+		} catch {
+			readError.textContent = t.error;
+		} finally {
+			loading = false;
+		}
+	}
+	form.onsubmit = async (event) => {
+		event.preventDefault();
+		if (post.disabled) return;
+		const body = commentBody.safeParse(input.value.trim());
+		if (!body.success) {
+			feedback.textContent = t.addComment;
+			return;
+		}
+		if (draft?.body !== body.data) draft = { body: body.data, id: newTaskId() };
+		post.disabled = true;
+		input.readOnly = true;
+		try {
+			await call<TaskComment>("comment", {
+				taskId: task.id,
+				commentId: draft.id,
+				body: draft.body,
+			});
+			draft = undefined;
+			if (section.isConnected && dialog.open) dialog.close();
+		} catch {
+			feedback.textContent = t.error;
+		} finally {
+			post.disabled = false;
+			input.readOnly = false;
+		}
+	};
+	form.ondragover = (event) => event.stopPropagation();
+	form.ondrop = (event) => event.stopPropagation();
+	const composerActions = group(post);
+	composerActions.classList.add("comment-actions");
+	form.append(field(t.addComment, input), composerActions, feedback);
+	section.append(element("h3", t.comments), older, list, readError, form);
+	dialogContent.append(section);
+	if (savedDraft?.focused) input.focus({ preventScroll: true });
+	renderComments();
+	refreshDiscussion = () => load();
+	void load();
+	return () => ({ text: input.value, focused: document.activeElement === input, pending: draft });
+}
+
 function attachmentView(file: Attachment, open: () => void): HTMLElement {
 	return button(file.name, open, "attachment");
 }
 
-async function preview(taskId: string, file: Attachment): Promise<void> {
-	const view = dialogContent;
+async function preview(taskId: string, file: Attachment, view: HTMLElement = dialogContent): Promise<void> {
 	const status = element("p", t.loading, "notice");
 	view.append(status);
 	try {
@@ -536,19 +872,10 @@ function showEditor(task?: Task, focusContext = false): void {
 	body.name = "body";
 	body.maxLength = 32768;
 	body.value = task?.body ?? "";
-	let manualTitle = false;
-	const titleFromBody = () =>
-		body.value.trim() ? contextTitle({ files: [], text: body.value }, t.newTask) : "";
-	const suggestTitle = () => {
-		if (task) return;
-		const suggestion = titleFromBody();
-		title.required = !suggestion;
-		if (!manualTitle) title.value = suggestion;
+	const updateTitleRequirement = () => {
+		title.required = Boolean(task) || !body.value.trim();
 	};
-	title.oninput = () => {
-		manualTitle = Boolean(title.value.trim());
-	};
-	body.oninput = suggestTitle;
+	body.oninput = updateTitleRequirement;
 	const mode = element("select");
 	mode.name = "mode";
 	mode.add(new Option(t.auto, "auto"));
@@ -571,7 +898,7 @@ function showEditor(task?: Task, focusContext = false): void {
 	const addContext = (context: TransferredContext) => {
 		if (context.files.length) attachments.addFiles(context.files);
 		if (context.text) body.value = appendContextText(body.value, context.text);
-		suggestTitle();
+		updateTitleRequirement();
 	};
 	installDropSurface(form, addContext);
 	form.onpaste = (event) => {
@@ -598,6 +925,16 @@ function showEditor(task?: Task, focusContext = false): void {
 	form.onsubmit = async (event) => {
 		event.preventDefault();
 		if (mutation) return;
+		const board = scope;
+		const details = body.value;
+		const providedTitle = title.value.trim();
+		const resolvedTitle =
+			providedTitle || (!task && details.trim() ? contextTitle({ files: [], text: details }, t.newTask) : "");
+		if (!resolvedTitle) {
+			status.textContent = t.title;
+			title.focus();
+			return;
+		}
 		mutation = true;
 		save.disabled = true;
 		form.inert = true;
@@ -605,16 +942,30 @@ function showEditor(task?: Task, focusContext = false): void {
 		status.textContent = "";
 		try {
 			const input = {
-				title: title.value.trim() || titleFromBody(),
-				body: body.value,
+				title: resolvedTitle,
+				body: details,
 				mode: mode.value,
 				keep: attachments.keep(),
 				files: await attachments.encode(),
 			};
-			if (task) await call("edit", { taskId, input, expectedRevision: task.revision });
-			else await createTask({ taskId, input });
+			if (scope !== board || !form.isConnected) return;
+			if (task)
+				await call("edit", {
+					taskId,
+					input,
+					expectedRevision: task.revision,
+					preserveTitle: providedTitle === task.title,
+				});
+			const added = task
+				? undefined
+				: await createTask({ taskId, input, ...(!providedTitle ? { generateTitle: locale } : {}) }, true);
+			if (scope !== board) return;
 			dialog.close();
-			void refresh(true);
+			if (added) {
+				transferMessage(t.taskAdded);
+				void revealCreatedTask(added);
+				if (added.wake && app.getHostCapabilities()?.message?.text) void resumeChat(true);
+			} else void refresh(true);
 		} catch (error) {
 			const code = error instanceof Error ? error.message : "internal_error";
 			status.textContent =
@@ -632,6 +983,9 @@ function showEditor(task?: Task, focusContext = false): void {
 	};
 	dialogContent.append(savingStatus, form);
 	(!task || focusContext ? body : title).focus();
+	const droppedImage =
+		focusContext && task ? task.attachments.find((file) => safeImages.has(file.mime)) : undefined;
+	if (task && droppedImage) void preview(task.id, droppedImage, attachments.section);
 }
 
 function makeAttachments(task: Task | undefined, status: HTMLElement) {
@@ -769,7 +1123,7 @@ async function saveDroppedContext(
 				const keep = task?.attachments.map(({ id }) => id) ?? [];
 				command = {
 					taskId: newId,
-					...(task ? { expectedRevision: task.revision } : {}),
+					...(task ? { expectedRevision: task.revision, preserveTitle: true } : {}),
 					input: {
 						title: task?.title ?? contextTitle(context, t.newTask),
 						body: appendContextText(task?.body ?? "", context.text),
@@ -780,11 +1134,12 @@ async function saveDroppedContext(
 				};
 			}
 			if (scope !== board) return;
-			const saved = taskId ? await call<Task>("edit", command) : await createTask(command);
+			const saved = taskId ? await call<Task>("edit", command) : await createTask(command, true);
+			if (scope !== board) return;
 			transferMessage(taskId ? t.contextAdded : t.taskAdded);
 			if (!taskId) {
-				switchList(false);
-				if (!dialog.open) showEditor(saved, true);
+				switchList([]);
+				openDropEditor(saved, board, "wake" in saved && saved.wake === true);
 			} else {
 				if (stillShowingDetail()) {
 					showDetails(saved);
@@ -807,9 +1162,34 @@ async function saveDroppedContext(
 	await save();
 }
 
-installDropSurface(main, (context, event) => void saveDroppedContext(context, dropTaskId(event.target)));
+function openDropEditor(task: Task, board: string, wake: boolean): void {
+	if (scope !== board) return;
+	if (dialog.open) {
+		dialog.addEventListener("close", () => openDropEditor(task, board, wake), { once: true });
+		return;
+	}
+	showEditor(task, true);
+	if (wake) {
+		dialog.addEventListener(
+			"close",
+			async () => {
+				if (scope !== board || !app.getHostCapabilities()?.message?.text) return;
+				try {
+					const result = await call<{ wake: boolean }>("can_resume", { taskId: task.id });
+					if (result.wake && scope === board) void resumeChat(true);
+				} catch {
+					// The saved task remains available for manual resumption.
+				}
+			},
+			{ once: true },
+		);
+	}
+}
+
+installDropSurface(main, (context) => void saveDroppedContext(context));
 document.addEventListener("paste", (event) => {
 	if (!scope || dialog.open || !event.clipboardData || !acceptsContext(event.clipboardData)) return;
+	if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
 	const context = captureContext(event.clipboardData);
 	if (!hasContext(context)) return;
 	event.preventDefault();
@@ -820,12 +1200,12 @@ app.ontoolresult = (result) => {
 	const binding = id.safeParse(result._meta?.binding);
 	if (!binding.success || scope === binding.data) return;
 	scope = binding.data;
+	dialog.close();
 	add.disabled = false;
 	quickTitle.disabled = false;
 	quickSubmit.disabled = false;
-	active.disabled = false;
-	cancelled.disabled = false;
-	switchList(false);
+	for (const { toggle } of filterButtons) toggle.disabled = false;
+	switchList([]);
 };
 function updateHostStyle(context?: McpUiHostContext): void {
 	if (context?.theme) applyDocumentTheme(context.theme);
@@ -840,6 +1220,8 @@ try {
 	notice.textContent = t.error;
 }
 const timer = window.setInterval(() => {
-	if (!document.hidden && !dialog.open && !mutation) void refresh();
+	if (document.hidden || mutation) return;
+	if (dialog.open) void refreshDiscussion?.();
+	else void refresh();
 }, POLL_MS);
 window.addEventListener("pagehide", () => window.clearInterval(timer), { once: true });

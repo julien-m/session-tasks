@@ -10,6 +10,8 @@ The chat and panel share a persistent task queue. The panel displays the current
 
 Completion requires the agent to report the work performed, an executed check, the observed result and evidence. If a check fails or cannot run, the agent records a blocker. The task details display those fields. Click the checkmark or **Mark as to do** to queue the same task for another attempt.
 
+Use **Validate** and enter what you checked and observed. You can validate a queued or blocked task yourself, or add a human check to a task Codex completed while keeping its original evidence. **Unblock** returns the task to the queue. Its previous blocker stays in the task's discussion. Posting a comment saves it on the task and takes you back to the list. Use the **Remaining**, **Blocked**, and **Done** buttons independently to combine filters.
+
 ## Host integration
 
 The plugin uses the supported MCP App thread tab and lifecycle hooks. The desired inline location between Outputs and Sources is a host integration requirement. The installed host composes that rail from built-in sections and its public MCP entrypoints support a thread tab without a rail placement field.
@@ -31,8 +33,8 @@ Run `npm run verify-live-add` for the live continuation check. It starts a dispo
 
 The experimental native summary companion is separate from the MCP plugin package. Its version-guarded script stages a copy of Codex, inserts the read-only task list immediately after Sources, verifies the archive and signs the staged copy. Installation requires a compatible signing team for its linked libraries and a clean shutdown. The exchange is atomic and leaves the prior bundle in the staging directory for restoration.
 
-In the panel, drop a file, image or plain text on a task row or its details to attach it to that task. Dropping or pasting on the panel background creates a queued task with a generated title and opens its editor. The task is already saved, so the optional description can be skipped. In the editor, plain text typed or pasted into a field keeps the field's normal behavior. Images and files can be dropped or pasted anywhere in the form. Use **Browse** if a file cannot be dragged.
+In the panel, drop a file, image or plain text anywhere on the list to create a queued task and open its editor. Open a task's details before dropping a file to attach it there. Pasting on a focused row attaches to that task. Pasting on the panel background creates a task. Text pasted into an input keeps its normal behavior. The list scrolls independently of the add and filter controls.
 
-When you add a task manually, the editor focuses the details. The first nonempty line suggests a title that you can edit before saving.
+When you save a task in the full editor without a title, the task is created with the first non-empty line of the details and the editor closes. Session Tasks shows **Generating title…** on the row while GPT-6.1 Terra, in Low reasoning at standard speed, uses up to 1,600 characters to generate a short title in the background. If generation is unavailable, the provisional title remains. A title you enter yourself is used directly.
 
-Use the small **+** to open the full editor, or type a title in the list and press **Enter** to add it immediately. Click a task title to see its instructions, verification evidence, attachments and expandable revision history. Click the pencil to edit it directly. Codex controls the width of the native tab; the panel layout adapts when you resize it.
+Use the small **+** to open the full editor, or type a title in the list and press **Enter** to add it immediately. Click a task title to see its instructions, verification evidence, attachments and expandable revision history. Click the pencil to edit it directly. After successful validation, the panel returns to the list unless you have an unfinished comment. The version is shown below the filters. Codex controls the width of the native tab; the panel layout adapts when you resize it.

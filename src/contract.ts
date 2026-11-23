@@ -18,6 +18,10 @@ export const serial = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export const mode = z.enum(["auto", "thread"]);
 export const state = z.enum(["queued", "running", "blocked", "done", "cancelled"]);
 export const actor = z.enum(["agent", "user"]);
+export const boardFilter = z.enum(["all", "remaining", "blocked", "done", "cancelled"]);
+export type BoardFilter = z.infer<typeof boardFilter>;
+export const commentBody = textBytes(8192).refine((value) => value.trim().length > 0);
+export const manualCheck = textBytes(1200).refine((value) => value.trim().length > 0);
 export const receipt = textBytes(8192).refine((value) => value.trim().length > 0);
 const verificationText = textBytes(1500).refine((value) => value.trim().length > 0);
 export const verification = z
@@ -96,7 +100,17 @@ export interface Task extends Revision {
 	assignee: string | null;
 	receipt: string | null;
 	verification?: Verification;
+	manualValidation?: string;
 	updatedAt: number;
+}
+
+export interface TaskComment {
+	id: string;
+	ordinal: number;
+	author: Actor;
+	kind: "comment" | "blocker";
+	body: string;
+	createdAt: number;
 }
 
 export type TaskSummary = Pick<
