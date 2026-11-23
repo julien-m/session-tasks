@@ -24,6 +24,7 @@ import {
 	MAX_PAGE,
 	manualCheck,
 	type Revision,
+	resumeCodePrefix,
 	type Task,
 	type TaskComment,
 	type TaskSummary,
@@ -52,6 +53,14 @@ function button(text: string, action: () => void, className = "quiet"): HTMLButt
 	const control = element("button", text, className);
 	control.type = "button";
 	control.onclick = action;
+	return control;
+}
+
+function taskSubmit(text: string, className: string): HTMLButtonElement {
+	const control = element("button", text, className);
+	control.type = "submit";
+	control.dataset.taskSubmit = "";
+	control.setAttribute("aria-keyshortcuts", "Meta+Enter Control+Enter");
 	return control;
 }
 function group(...children: Node[]): HTMLDivElement {
@@ -108,6 +117,21 @@ main.tabIndex = 0;
 const dialog = element("dialog");
 dialog.addEventListener("cancel", (event) => {
 	if (mutation) event.preventDefault();
+});
+dialog.addEventListener("keydown", (event) => {
+	if (
+		event.defaultPrevented ||
+		event.key !== "Enter" ||
+		!(event.metaKey || event.ctrlKey) ||
+		event.altKey ||
+		event.shiftKey ||
+		event.isComposing
+	)
+		return;
+	const submit = dialog.querySelector<HTMLButtonElement>("button[data-task-submit]");
+	if (!submit?.form || !dialog.open) return;
+	event.preventDefault();
+	if (!event.repeat && !mutation && !submit.disabled) submit.form.requestSubmit(submit);
 });
 dialog.setAttribute("aria-labelledby", "task-dialog-title");
 const dialogContent = element("div", undefined, "dialog-content");
@@ -257,12 +281,13 @@ async function resumeChat(automatic = false): Promise<void> {
 	resume.disabled = true;
 	try {
 		const board = scope;
-		const request = await call<{ requested: boolean }>("request_resume");
-		if (!request.requested || scope !== board) return;
+		const request = await call<{ requested: boolean; code?: string }>("request_resume");
+		if (!request.requested || !request.code || scope !== board) return;
+		const prompt = automatic ? t.automaticResumePrompt : t.resumePrompt;
 		const response = await app.sendMessage(
 			{
 				role: "user",
-				content: [{ type: "text", text: automatic ? t.automaticResumePrompt : t.resumePrompt }],
+				content: [{ type: "text", text: `${prompt}\n\n${resumeCodePrefix}${request.code}` }],
 			},
 			{ timeout: 10000, maxTotalTimeout: 10000 },
 		);
@@ -547,8 +572,7 @@ function showValidation(task: Task, draft?: DiscussionDraft): void {
 	const observation = element("textarea");
 	observation.required = true;
 	observation.maxLength = 1200;
-	const confirm = element("button", t.confirmValidation, "detail-validate");
-	confirm.type = "submit";
+	const confirm = taskSubmit(t.confirmValidation, "detail-validate");
 	const feedback = element("p", undefined, "notice");
 	feedback.setAttribute("role", "status");
 	const validationEvents = new AbortController();
@@ -865,30 +889,25 @@ function showEditor(task?: Task, focusContext = false): void {
 	form.setAttribute("aria-labelledby", "task-dialog-title");
 	const title = element("input");
 	title.name = "title";
-	title.required = true;
+	title.required = Boolean(task);
 	title.maxLength = 240;
 	title.value = task?.title ?? "";
 	const body = element("textarea");
 	body.name = "body";
 	body.maxLength = 32768;
 	body.value = task?.body ?? "";
-	const updateTitleRequirement = () => {
-		title.required = Boolean(task) || !body.value.trim();
-	};
-	body.oninput = updateTitleRequirement;
 	const mode = element("select");
 	mode.name = "mode";
 	mode.add(new Option(t.auto, "auto"));
 	mode.add(new Option(t.thread, "thread"));
 	mode.value = task?.mode ?? "auto";
 	const taskId = task?.id ?? newTaskId();
-	const save = element("button", t.save, "primary");
-	save.type = "submit";
+	const save = taskSubmit(t.save, "primary");
 	const status = element("p", undefined, "notice");
 	status.setAttribute("role", "status");
 	const attachments = makeAttachments(task, status);
 	form.append(
-		field(t.title, title),
+		field(task ? t.title : t.optionalTitle, title),
 		field(t.detail, body),
 		field(t.delegation, mode),
 		attachments.section,
@@ -898,7 +917,6 @@ function showEditor(task?: Task, focusContext = false): void {
 	const addContext = (context: TransferredContext) => {
 		if (context.files.length) attachments.addFiles(context.files);
 		if (context.text) body.value = appendContextText(body.value, context.text);
-		updateTitleRequirement();
 	};
 	installDropSurface(form, addContext);
 	form.onpaste = (event) => {
@@ -914,12 +932,6 @@ function showEditor(task?: Task, focusContext = false): void {
 		event.preventDefault();
 		addContext(context);
 	};
-	form.onkeydown = (event) => {
-		if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-			event.preventDefault();
-			form.requestSubmit();
-		}
-	};
 	const savingStatus = element("p", undefined, "notice");
 	savingStatus.setAttribute("role", "status");
 	form.onsubmit = async (event) => {
@@ -928,13 +940,19 @@ function showEditor(task?: Task, focusContext = false): void {
 		const board = scope;
 		const details = body.value;
 		const providedTitle = title.value.trim();
-		const resolvedTitle =
-			providedTitle || (!task && details.trim() ? contextTitle({ files: [], text: details }, t.newTask) : "");
-		if (!resolvedTitle) {
+		if (task && !providedTitle) {
 			status.textContent = t.title;
 			title.focus();
 			return;
 		}
+		const files = attachments.selectedFiles();
+		if (!providedTitle && !hasContext({ files, text: details })) {
+			status.textContent = t.addTaskContext;
+			body.focus();
+			return;
+		}
+		const resolvedTitle =
+			providedTitle || contextTitle({ files: details.trim() ? [] : files, text: details }, t.newTask);
 		mutation = true;
 		save.disabled = true;
 		form.inert = true;
@@ -1047,6 +1065,7 @@ function makeAttachments(task: Task | undefined, status: HTMLElement) {
 	return {
 		section,
 		addFiles,
+		selectedFiles: () => selected,
 		keep: () => existing.map((file) => file.id),
 		encode: () => encodeFiles(selected, existing.length),
 	};

@@ -1,5 +1,5 @@
 /** Task commands and revision-aware work ownership. */
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
 	type Actor,
 	type BoardFilter,
@@ -8,6 +8,7 @@ import {
 	MAX_UPLOAD_BYTES,
 	manualCheck,
 	type Revision,
+	resumeCode,
 	type Task,
 	type TaskComment,
 	TaskError,
@@ -23,6 +24,11 @@ const inactive = (state: "queued" | "cancelled"): TaskStatus => ({
 	claim: null,
 	receipt: null,
 });
+const RESUME_TTL_MS = 30_000;
+
+function hashResumeCode(code: string): string {
+	return createHash("sha256").update(code).digest("hex");
+}
 interface VersionedTask {
 	scope: string;
 	taskId: string;
@@ -86,13 +92,17 @@ export class TaskService {
 		return this.requireTask(scope, taskId).state === "queued" ? this.store.threadForScope(scope) : undefined;
 	}
 
-	requestResume(scope: string): boolean {
+	requestResume(scope: string): string | undefined {
 		this.store.assertScope(scope);
-		return this.store.requestResume(scope, this.now() + 30_000);
+		const code = randomBytes(16).toString("hex");
+		const now = this.now();
+		if (this.store.requestResume(scope, hashResumeCode(code), now, now + RESUME_TTL_MS)) return code;
 	}
 
-	consumeResume(scope: string): boolean {
-		return this.store.consumeResume(scope, this.now());
+	consumeResume(scope: string, code: string): boolean {
+		return (
+			resumeCode.safeParse(code).success && this.store.consumeResume(scope, hashResumeCode(code), this.now())
+		);
 	}
 
 	/** Records an explicit human check on the current task without an agent claim. */

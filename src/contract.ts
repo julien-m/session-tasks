@@ -14,6 +14,11 @@ const textBytes = (maximum: number) =>
 		.refine((value) => byteLength(value) <= maximum);
 export const threadId = textBytes(256).refine((value) => value.trim().length > 0);
 export const id = z.uuidv4();
+export const resumeCode = z
+	.string()
+	.length(32)
+	.regex(/^[0-9a-f]{32}$/u);
+export const resumeCodePrefix = "Session Tasks resume code: ";
 export const serial = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export const mode = z.enum(["auto", "thread"]);
 export const state = z.enum(["queued", "running", "blocked", "done", "cancelled"]);

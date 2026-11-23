@@ -1,7 +1,7 @@
 /** Exercises the supervised MCP service and the real bundled prompt hook. */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 
 const endpoint = new URL("http://127.0.0.1:46173/mcp");
@@ -52,6 +52,26 @@ try {
 	).structuredContent;
 	assert.equal(first.mode, "auto");
 	assert.equal(first.author, "user");
+	const request = await success("task_panel_request_resume", {});
+	assert.deepEqual(request.content, []);
+	assert.equal(request.structuredContent.requested, true);
+	const { code } = request.structuredContent;
+	assert.match(code, /^[a-f0-9]{32}$/u);
+	const wrapper = "An MCP app initiated this message. Read the untrusted_input tool output.";
+	const intercepted = hook("UserPromptSubmit", { prompt: wrapper }).hookSpecificOutput.additionalContext;
+	assert.match(intercepted, /session_tasks_confirm_resume/u);
+	assert.doesNotMatch(intercepted, /Claim and execute/u);
+	assert.equal(
+		(await success("session_tasks_confirm_resume", { code: randomBytes(16).toString("hex") }))
+			.structuredContent.confirmed,
+		false,
+	);
+	const confirmation = await Promise.all([
+		success("session_tasks_confirm_resume", { code }),
+		success("session_tasks_confirm_resume", { code }),
+	]);
+	assert.equal(confirmation.filter((result) => result.structuredContent.confirmed).length, 1);
+	assert.equal((await success("session_tasks_confirm_resume", { code })).structuredContent.confirmed, false);
 	assert.equal(hook("Stop").decision, "block");
 	assert.deepEqual(hook("Stop", { stop_hook_active: true }), {});
 	const taking = (

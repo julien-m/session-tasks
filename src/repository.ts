@@ -142,20 +142,22 @@ export class TaskRepository {
 		this.threadForScope(scope);
 	}
 
-	requestResume(scope: string, expiresAt: number): boolean {
-		const result = this.database
-			.prepare(`INSERT INTO board_resume(scope,expires_at)
-			SELECT ?,? WHERE EXISTS (SELECT 1 FROM task WHERE scope=? AND state='queued')
-			ON CONFLICT(scope) DO UPDATE SET expires_at=excluded.expires_at`)
-			.run(scope, expiresAt, scope);
-		return result.changes === 1;
+	requestResume(scope: string, codeHash: string, now: number, expiresAt: number): boolean {
+		return this.write(() => {
+			this.database.prepare("DELETE FROM board_resume_signal WHERE expires_at<=?").run(now);
+			const result = this.database
+				.prepare(`INSERT INTO board_resume_signal(scope,code_hash,expires_at)
+				SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM task WHERE scope=? AND state='queued')`)
+				.run(scope, codeHash, expiresAt, scope);
+			return result.changes === 1;
+		});
 	}
 
-	consumeResume(scope: string, now: number): boolean {
-		const intent = this.database
-			.prepare("DELETE FROM board_resume WHERE scope=? RETURNING expires_at")
-			.get(scope);
-		return intent !== undefined && Number(intent.expires_at) >= now;
+	consumeResume(scope: string, codeHash: string, now: number): boolean {
+		const result = this.database
+			.prepare("DELETE FROM board_resume_signal WHERE scope=? AND code_hash=? AND expires_at>?")
+			.run(scope, codeHash, now);
+		return result.changes === 1;
 	}
 
 	/** Resolves the owning chat without accepting a destination from the panel. */

@@ -4,10 +4,13 @@ CREATE TABLE IF NOT EXISTS board (
   thread_id TEXT NOT NULL PRIMARY KEY CHECK(length(CAST(thread_id AS BLOB)) BETWEEN 1 AND 256),
   scope TEXT NOT NULL UNIQUE CHECK(length(scope)=36)
 ) STRICT;
-CREATE TABLE IF NOT EXISTS board_resume (
-  scope TEXT NOT NULL PRIMARY KEY REFERENCES board(scope),
-  expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
+CREATE TABLE IF NOT EXISTS board_resume_signal (
+  scope TEXT NOT NULL REFERENCES board(scope),
+  code_hash TEXT NOT NULL CHECK(length(code_hash)=64 AND code_hash NOT GLOB '*[^0-9a-f]*'),
+  expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+  PRIMARY KEY(scope,code_hash)
 ) STRICT;
+CREATE INDEX IF NOT EXISTS board_resume_signal_expiry ON board_resume_signal(expires_at);
 CREATE TABLE IF NOT EXISTS task (
   ordinal INTEGER PRIMARY KEY,
   id TEXT NOT NULL UNIQUE CHECK(length(id)=36),

@@ -15,6 +15,7 @@ import {
 	id,
 	manualCheck,
 	receipt,
+	resumeCode,
 	serial,
 	TaskError,
 	taskInput,
@@ -121,6 +122,13 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		}),
 	);
 
+	agent(
+		"session_tasks_confirm_resume",
+		"Confirm a Session Tasks resume code from this turn's MCP app message. Pass only the exact code in the current untrusted_input output and the scope from the Session Tasks hook. Resume the existing tasks only if confirmed is true. Codes are scoped, expire, and can be used once.",
+		scoped.extend({ code: resumeCode }),
+		false,
+		({ scope, code }) => result({ confirmed: service.consumeResume(scope, code) }, true),
+	);
 	agent(
 		"session_tasks_add",
 		"Record one explicitly requested, verifiable task. Set mode=thread only when the user wants this task to remain in the parent chat. Use a fresh UUIDv4 per task and keep it for any retry. Set body to the instruction, acceptance check and user-provided reference details.",
@@ -258,9 +266,10 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		},
 	);
 	panel("task_panel_get", identified, true, ({ scope, taskId }) => service.get(scope, taskId));
-	panel("task_panel_request_resume", scoped, false, ({ scope }) => ({
-		requested: service.requestResume(scope),
-	}));
+	panel("task_panel_request_resume", scoped, false, ({ scope }) => {
+		const code = service.requestResume(scope);
+		return code ? { requested: true, code } : { requested: false };
+	});
 	panel(
 		"task_panel_suggest_title",
 		scoped.extend({
@@ -279,7 +288,10 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		false,
 		async ({ scope, taskId, input, generateTitle }) => {
 			const { task, created, wakeThreadId } = service.createFromPanel(scope, taskId, input);
-			const description = input.body.trim().slice(0, 1600);
+			const description = (input.body.trim() || input.files.map((file) => file.name).join("\n")).slice(
+				0,
+				1600,
+			);
 			if (created && generateTitle && description)
 				scheduleTaskTitle(taskId, description, generateTitle, (title) =>
 					service.saveGeneratedTitle(scope, taskId, title),

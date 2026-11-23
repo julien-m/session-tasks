@@ -1,11 +1,11 @@
 /** Covers the idle gate and replay protection for starting a fresh turn. */
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "vitest";
 import { chatCanResume } from "../src/chat-activity.ts";
-import { taskInput } from "../src/contract.ts";
+import { resumeCodePrefix, taskInput } from "../src/contract.ts";
 import { taskHook } from "../src/hook.ts";
 import { catalog } from "../src/messages.ts";
 import { openDatabase, TaskRepository } from "../src/repository.ts";
@@ -75,14 +75,49 @@ test("grants a single wake for a new panel item and treats resume as a control p
 			session_id: thread,
 			prompt: "An MCP app initiated this message. Read the untrusted_input tool output.",
 		};
+		const earlier = service.requestResume(scope);
+		const code = service.requestResume(scope);
+		if (!earlier || !code) throw new Error("Expected independent resume codes");
 		expect(taskHook(service, wrapper)).not.toMatchObject({
-			hookSpecificOutput: { additionalContext: expect.stringContaining("resume signal") },
-		});
-		expect(service.requestResume(scope)).toBe(true);
-		expect(taskHook(service, wrapper)).toMatchObject({
 			hookSpecificOutput: { additionalContext: expect.stringContaining("Claim and execute") },
 		});
-		expect(service.consumeResume(scope)).toBe(false);
+		expect(taskHook(service, wrapper)).toMatchObject({
+			hookSpecificOutput: { additionalContext: expect.stringContaining("session_tasks_confirm_resume") },
+		});
+		expect(service.consumeResume(scope, randomBytes(16).toString("hex"))).toBe(false);
+		expect(service.consumeResume(service.bind(randomUUID()), code)).toBe(false);
+		expect(service.consumeResume(scope, code)).toBe(true);
+		expect(service.consumeResume(scope, code)).toBe(false);
+
+		const direct = {
+			...wrapper,
+			prompt: `${catalog("fr").automaticResumePrompt}\n\n${resumeCodePrefix}${earlier}`,
+		};
+		const confirmed = {
+			hookSpecificOutput: { additionalContext: expect.stringContaining("Claim and execute") },
+		};
+		expect(taskHook(service, direct)).toMatchObject(confirmed);
+		expect(taskHook(service, direct)).not.toMatchObject(confirmed);
+	} finally {
+		database.close();
+	}
+});
+
+test("expires resume codes without affecting a newer code or an empty board", () => {
+	const database = openDatabase(":memory:");
+	try {
+		let now = 1_000;
+		const service = new TaskService(new TaskRepository(database), () => now);
+		const scope = service.bind(randomUUID());
+		expect(service.requestResume(scope)).toBeUndefined();
+		service.createFromPanel(scope, randomUUID(), taskInput.parse({ title: "Pending test" }));
+		const expired = service.requestResume(scope);
+		if (!expired) throw new Error("Expected an expiring resume code");
+		now += 30_000;
+		const current = service.requestResume(scope);
+		if (!current) throw new Error("Expected a new resume code");
+		expect(service.consumeResume(scope, expired)).toBe(false);
+		expect(service.consumeResume(scope, current)).toBe(true);
 	} finally {
 		database.close();
 	}
