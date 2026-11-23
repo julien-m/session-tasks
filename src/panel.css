@@ -33,8 +33,7 @@ fieldset,
 .task,
 .revision,
 .dialog-content,
-.rows,
-.progress:not([hidden]) {
+.rows {
 	display: flex;
 	flex-direction: column;
 	gap: var(--space-sm);
@@ -78,9 +77,6 @@ main {
 .field {
 	flex-direction: column;
 	gap: var(--space-xs);
-}
-.heading {
-	justify-content: space-between;
 }
 .title-row {
 	align-items: flex-start;
@@ -263,8 +259,15 @@ img {
 	}
 }
 
-.heading h1 {
+.board-header h1 {
 	font-size: 0.95rem;
+}
+.progress:not([hidden]),
+.board-add {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	align-items: center;
+	gap: var(--space-sm);
 }
 .icon-button {
 	display: grid;

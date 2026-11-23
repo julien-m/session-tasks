@@ -2,6 +2,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
 	type Actor,
+	appendContextText,
 	type BoardFilter,
 	commentBody,
 	MAX_FILE_BYTES,
@@ -13,6 +14,7 @@ import {
 	type TaskComment,
 	TaskError,
 	type TaskInput,
+	taskInput,
 	type Verification,
 	verification,
 } from "./contract.ts";
@@ -182,8 +184,8 @@ export class TaskService {
 		return this.insert(scope, taskId, input, "user", true);
 	}
 
-	saveGeneratedTitle(scope: string, taskId: string, title: string): void {
-		this.store.saveGeneratedTitle(scope, taskId, title);
+	saveGeneratedTitle(scope: string, taskId: string, title: string, split = false): void {
+		this.store.saveGeneratedTitle(scope, taskId, title, split);
 	}
 
 	private insert(
@@ -212,7 +214,12 @@ export class TaskService {
 	}
 
 	/** Changes the instruction and requeues it atomically, invalidating any old claim. */
-	edit(command: RevisionEdit, input: TaskInput, author: Actor, preserveTitle = false): Task {
+	edit(
+		command: RevisionEdit,
+		input: TaskInput,
+		author: Actor,
+		{ preserveTitle = false, preserveBody = false, appendBody = "" } = {},
+	): Task {
 		const files = decodeFiles(input);
 		return this.store.write(() => {
 			const row = this.requireTask(command.scope, command.taskId);
@@ -223,16 +230,22 @@ export class TaskService {
 			if (input.keep.some((id) => !current.attachments.some((file) => file.id === id)))
 				throw new TaskError("invalid_attachment");
 			const title = preserveTitle ? row.title : input.title;
+			const body = appendBody
+				? appendContextText(row.body, appendBody)
+				: preserveBody
+					? row.body
+					: input.body;
+			if (!taskInput.shape.body.safeParse(body).success) throw new TaskError("invalid_context");
 			const unchanged =
 				title === row.title &&
-				input.body === row.body &&
+				body === row.body &&
 				input.mode === row.mode &&
 				files.length === 0 &&
 				input.keep.length === current.attachments.length &&
 				input.keep.every((id, index) => id === current.attachments[index]?.id);
 			if (unchanged) return this.store.task(row);
 			const now = this.now();
-			this.saveRevision(row.id, row.revision + 1, { ...input, title }, author, now, files);
+			this.saveRevision(row.id, row.revision + 1, { ...input, title, body }, author, now, files);
 			this.store.update(command.scope, row.id, row, inactive("queued"), now, row.revision + 1);
 			return this.get(command.scope, row.id);
 		});

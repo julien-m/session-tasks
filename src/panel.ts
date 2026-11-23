@@ -8,7 +8,6 @@ import {
 import manifest from "../plugin.json" with { type: "json" };
 import {
 	acceptsContext,
-	appendContextText,
 	captureContext,
 	contextTitle,
 	encodeFiles,
@@ -18,16 +17,20 @@ import {
 } from "./context-transfer.ts";
 import {
 	type Attachment,
+	appendContextText,
 	type BoardFilter,
+	byteLength,
 	commentBody,
 	id,
 	MAX_PAGE,
+	MAX_TASK_BODY_BYTES,
 	manualCheck,
 	type Revision,
 	resumeCodePrefix,
 	type Task,
 	type TaskComment,
 	type TaskSummary,
+	taskInput,
 } from "./contract.ts";
 import { catalog } from "./messages.ts";
 import type { BoardList, CommentsPage } from "./repository.ts";
@@ -105,7 +108,7 @@ const progress = element("progress");
 progress.setAttribute("aria-label", t.progress);
 const progressText = element("span", undefined, "meta");
 const progressGroup = element("div", undefined, "progress");
-progressGroup.append(progress);
+progressGroup.append(progress, progressText);
 progressGroup.hidden = true;
 const notice = element("p", t.loading, "notice");
 notice.setAttribute("role", "status");
@@ -145,7 +148,6 @@ const quickTitle = element("input");
 quickTitle.setAttribute("aria-label", t.quickAdd);
 quickTitle.name = "title";
 quickTitle.placeholder = t.quickAdd;
-quickTitle.maxLength = 240;
 quickTitle.required = true;
 quickTitle.disabled = true;
 const quickSubmit = element("button", "↵", "icon-button");
@@ -153,24 +155,32 @@ quickSubmit.type = "submit";
 quickSubmit.setAttribute("aria-label", t.quickAdd);
 quickSubmit.disabled = true;
 quickAdd.append(quickTitle, quickSubmit);
+function titleOnlyInput(text: string): { title: string; body: string } {
+	const title = contextTitle({ files: [], text }, t.newTask);
+	return { title, body: text.trim() === title ? "" : text };
+}
+
 let quickPending: { draft: string; board: string; taskId: string } | undefined;
 quickAdd.onsubmit = async (event) => {
 	event.preventDefault();
 	const draft = quickTitle.value;
 	if (mutation || !scope || !draft.trim()) return;
+	if (draft.length > MAX_TASK_BODY_BYTES || byteLength(draft) > MAX_TASK_BODY_BYTES) {
+		transferMessage(t.taskTextTooLong);
+		return;
+	}
 	if (quickPending?.board !== scope || quickPending.draft !== draft)
 		quickPending = { draft, board: scope, taskId: newTaskId() };
 	const { taskId, board } = quickPending;
-	const title = contextTitle({ files: [], text: draft }, t.newTask);
+	const input = titleOnlyInput(draft);
 	mutation = true;
 	quickSubmit.disabled = true;
 	try {
-		await createTask({ taskId, input: { title } });
+		const saved = await createTask({ taskId, input, splitTitle: locale });
 		quickPending = undefined;
 		if (scope !== board) return;
 		if (quickTitle.value === draft) quickTitle.value = "";
-		if (selectedFilters.length && !selectedFilters.includes("remaining")) switchList(["remaining"]);
-		else await refresh(true);
+		void revealCreatedTask(saved);
 	} catch {
 		notice.textContent = t.error;
 	} finally {
@@ -222,14 +232,20 @@ resume.hidden = true;
 const pageNavigation = group(previous, more);
 const filterBar = group(filters, cancelledFilter, resume);
 filterBar.classList.add("board-filters");
-const heading = group(group(element("h1", t.heading), progressText), add);
-heading.classList.add("heading");
 const boardHeader = element("header", undefined, "board-header");
-boardHeader.append(heading, progressGroup, quickAdd);
+boardHeader.append(element("h1", t.heading));
 const boardList = element("div", undefined, "board-list");
 boardList.append(transferNotice, notice, rows, dropZone);
+const addRow = element("div", undefined, "board-add");
+addRow.append(quickAdd, add);
 const boardFooter = element("footer", undefined, "board-footer");
-boardFooter.append(filterBar, pageNavigation, element("small", `v${manifest.version}`, "meta"));
+boardFooter.append(
+	filterBar,
+	pageNavigation,
+	element("small", `v${manifest.version}`, "meta"),
+	progressGroup,
+	addRow,
+);
 main.append(boardHeader, boardList, boardFooter);
 document.documentElement.lang = locale;
 document.body.append(main, dialog);
@@ -890,11 +906,11 @@ function showEditor(task?: Task, focusContext = false): void {
 	const title = element("input");
 	title.name = "title";
 	title.required = Boolean(task);
-	title.maxLength = 240;
+	if (task) title.maxLength = 240;
 	title.value = task?.title ?? "";
 	const body = element("textarea");
 	body.name = "body";
-	body.maxLength = 32768;
+	body.maxLength = MAX_TASK_BODY_BYTES;
 	body.value = task?.body ?? "";
 	const mode = element("select");
 	mode.name = "mode";
@@ -951,8 +967,27 @@ function showEditor(task?: Task, focusContext = false): void {
 			body.focus();
 			return;
 		}
-		const resolvedTitle =
-			providedTitle || contextTitle({ files: details.trim() ? [] : files, text: details }, t.newTask);
+		const titleOnly = !task && providedTitle && !details.trim() && !files.length;
+		if (
+			titleOnly &&
+			(title.value.length > MAX_TASK_BODY_BYTES || byteLength(title.value) > MAX_TASK_BODY_BYTES)
+		) {
+			status.textContent = t.taskTextTooLong;
+			title.focus();
+			return;
+		}
+		if (!titleOnly && providedTitle && !taskInput.shape.title.safeParse(providedTitle).success) {
+			status.textContent = t.taskTitleTooLong;
+			title.focus();
+			return;
+		}
+		const content = titleOnly
+			? titleOnlyInput(title.value)
+			: {
+					title:
+						providedTitle || contextTitle({ files: details.trim() ? [] : files, text: details }, t.newTask),
+					body: details,
+				};
 		mutation = true;
 		save.disabled = true;
 		form.inert = true;
@@ -960,23 +995,29 @@ function showEditor(task?: Task, focusContext = false): void {
 		status.textContent = "";
 		try {
 			const input = {
-				title: resolvedTitle,
-				body: details,
+				...content,
 				mode: mode.value,
 				keep: attachments.keep(),
 				files: await attachments.encode(),
 			};
 			if (scope !== board || !form.isConnected) return;
-			if (task)
+			if (task) {
+				const previouslyEmpty = !task.body.trim();
 				await call("edit", {
 					taskId,
 					input,
 					expectedRevision: task.revision,
 					preserveTitle: providedTitle === task.title,
+					preserveBody: details === task.body || (previouslyEmpty && !details.trim()),
+					appendBody: previouslyEmpty && details.trim() ? details : "",
 				});
-			const added = task
-				? undefined
-				: await createTask({ taskId, input, ...(!providedTitle ? { generateTitle: locale } : {}) }, true);
+			}
+			const titleOptions = !providedTitle
+				? { generateTitle: locale }
+				: titleOnly
+					? { splitTitle: locale }
+					: {};
+			const added = task ? undefined : await createTask({ taskId, input, ...titleOptions }, true);
 			if (scope !== board) return;
 			dialog.close();
 			if (added) {
@@ -1142,10 +1183,17 @@ async function saveDroppedContext(
 				const keep = task?.attachments.map(({ id }) => id) ?? [];
 				command = {
 					taskId: newId,
-					...(task ? { expectedRevision: task.revision, preserveTitle: true } : {}),
+					...(task
+						? {
+								expectedRevision: task.revision,
+								preserveTitle: true,
+								preserveBody: !context.text,
+								appendBody: context.text,
+							}
+						: {}),
 					input: {
 						title: task?.title ?? contextTitle(context, t.newTask),
-						body: appendContextText(task?.body ?? "", context.text),
+						body: task?.body ?? context.text,
 						mode: task?.mode ?? "auto",
 						keep,
 						files: await encodeFiles(context.files, keep.length),
@@ -1169,8 +1217,16 @@ async function saveDroppedContext(
 		} catch (error) {
 			const code = error instanceof Error ? error.message : "internal_error";
 			const message =
-				code === "conflict" ? t.unsigned : code === "invalid_attachment" ? t.fileError : t.contextError;
-			const retry = code === "conflict" || code === "invalid_attachment" ? undefined : () => void save();
+				code === "conflict"
+					? t.unsigned
+					: code === "invalid_attachment"
+						? t.fileError
+						: code === "invalid_context"
+							? t.taskTextTooLong
+							: t.contextError;
+			const retry = ["conflict", "invalid_attachment", "invalid_context"].includes(code)
+				? undefined
+				: () => void save();
 			transferMessage(message, retry);
 			if (stillShowingDetail())
 				dialogContent.append(element("p", message, "notice"), ...(retry ? [button(t.retry, retry)] : []));

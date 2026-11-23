@@ -97,8 +97,11 @@ export interface BoardList {
 }
 const currentContent = `FROM task t JOIN task_revision r ON r.task_id=t.id AND r.revision=t.revision
 LEFT JOIN task_generated_title g ON g.task_id=r.task_id AND g.revision=r.revision`;
-const SELECT_TASK = `SELECT t.*, COALESCE(g.title,r.title) title, r.body, r.mode, r.author, r.created_at
-${currentContent}`;
+const SELECT_TASK = `SELECT t.*, COALESCE(g.title,r.title) title,
+CASE WHEN split.task_id IS NOT NULL THEN r.title ELSE r.body END body,
+r.mode, r.author, r.created_at
+${currentContent}
+LEFT JOIN task_title_split split ON split.task_id=r.task_id AND split.revision=r.revision`;
 
 /** Opens a private SQLite database and initializes its schema. */
 export function openDatabase(path: string): DatabaseSync {
@@ -214,12 +217,16 @@ export class TaskRepository {
 	}
 
 	/** Adds a generated title only while the original task instructions are current. */
-	saveGeneratedTitle(scope: string, taskId: string, title: string): void {
-		this.database
-			.prepare(`INSERT INTO task_generated_title (task_id,revision,title)
-			SELECT id,revision,? FROM task WHERE scope=? AND id=? AND revision=1 AND state!='cancelled'
-			ON CONFLICT(task_id,revision) DO NOTHING`)
-			.run(title, scope, taskId);
+	saveGeneratedTitle(scope: string, taskId: string, title: string, split: boolean): void {
+		this.write(() => {
+			const result = this.database
+				.prepare(`INSERT INTO task_generated_title (task_id,revision,title)
+				SELECT id,revision,? FROM task WHERE scope=? AND id=? AND revision=1 AND state!='cancelled'
+				ON CONFLICT(task_id,revision) DO NOTHING`)
+				.run(title, scope, taskId);
+			if (split && result.changes === 1)
+				this.database.prepare("INSERT INTO task_title_split (task_id,revision) VALUES (?,1)").run(taskId);
+		});
 	}
 
 	/** Advances the current snapshot and operational state of a task. */

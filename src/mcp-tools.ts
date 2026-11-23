@@ -284,17 +284,26 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 	);
 	panel(
 		"task_panel_create",
-		create.extend({ generateTitle: z.enum(["en", "fr"]).optional() }),
+		create.extend({
+			generateTitle: z.enum(["en", "fr"]).optional(),
+			splitTitle: z.enum(["en", "fr"]).optional(),
+		}),
 		false,
-		async ({ scope, taskId, input, generateTitle }) => {
+		async ({ scope, taskId, input, generateTitle, splitTitle }) => {
 			const { task, created, wakeThreadId } = service.createFromPanel(scope, taskId, input);
-			const description = (input.body.trim() || input.files.map((file) => file.name).join("\n")).slice(
-				0,
-				1600,
-			);
-			if (created && generateTitle && description)
-				scheduleTaskTitle(taskId, description, generateTitle, (title) =>
-					service.saveGeneratedTitle(scope, taskId, title),
+			const locale = splitTitle ?? generateTitle;
+			const source =
+				input.body.trim() || (splitTitle ? input.title : input.files.map((file) => file.name).join("\n"));
+			const split = Boolean(splitTitle && !input.body.trim());
+			if (created && locale && source)
+				scheduleTaskTitle(
+					taskId,
+					source.slice(0, 1600),
+					locale,
+					(title) => {
+						if (!split || title !== input.title) service.saveGeneratedTitle(scope, taskId, title, split);
+					},
+					split ? "split" : "title",
 				);
 			const wake = wakeThreadId !== undefined && (await chatCanResume(wakeThreadId));
 			return { ...task, wake };
@@ -306,9 +315,14 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 	});
 	panel(
 		"task_panel_edit",
-		edit.extend({ preserveTitle: z.boolean().default(false) }),
+		edit.extend({
+			preserveTitle: z.boolean().default(false),
+			preserveBody: z.boolean().default(false),
+			appendBody: taskInput.shape.body,
+		}),
 		false,
-		({ input, preserveTitle, ...command }) => service.edit(command, input, "user", preserveTitle),
+		({ input, preserveTitle, preserveBody, appendBody, ...command }) =>
+			service.edit(command, input, "user", { preserveTitle, preserveBody, appendBody }),
 	);
 	panel("task_panel_cancel", versioned, false, (command) => service.cancel(command));
 	panel("task_panel_restore", versioned, false, (command) => service.requeue(command));

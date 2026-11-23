@@ -60,11 +60,6 @@ export function encodeFiles(
 	return Promise.all(files.map(encodeFile));
 }
 
-/** Adds text without rewriting indentation, line breaks or code. */
-export function appendContextText(before: string, appended: string): string {
-	return appended ? (before ? `${before}\n\n${appended}` : appended) : before;
-}
-
 /** Produces a descriptive, validated title for a drop that has no explicit instruction. */
 export function contextTitle(context: TransferredContext, fallback: string): string {
 	const source =

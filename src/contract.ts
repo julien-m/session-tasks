@@ -5,6 +5,12 @@ export const MAX_FILE_BYTES = 4 * 1024 * 1024;
 export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 export const MAX_FILES = 8;
 export const MAX_PAGE = 50;
+export const MAX_TASK_BODY_BYTES = 32768;
+
+/** Adds text without rewriting indentation, line breaks or code. */
+export function appendContextText(before: string, appended: string): string {
+	return appended ? (before ? `${before}\n\n${appended}` : appended) : before;
+}
 
 export const byteLength = (value: string): number => new TextEncoder().encode(value).length;
 const textBytes = (maximum: number) =>
@@ -64,7 +70,7 @@ export const taskInput = z
 			.max(240)
 			.transform((value) => value.trim())
 			.pipe(textBytes(240).refine(Boolean)),
-		body: textBytes(32768).default(""),
+		body: textBytes(MAX_TASK_BODY_BYTES).default(""),
 		mode: mode.default("auto"),
 		keep: z.array(id).max(MAX_FILES).default([]),
 		files: z.array(upload).max(MAX_FILES).default([]),
@@ -126,6 +132,7 @@ export type TaskSummary = Pick<
 export class TaskError extends Error {
 	constructor(
 		readonly code:
+			| "invalid_context"
 			| "not_found"
 			| "conflict"
 			| "invalid_state"

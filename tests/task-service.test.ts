@@ -37,7 +37,7 @@ test("adds generated titles without invalidating a claim or overwriting later ma
 	expect(service.history(scope, task.id)[0]?.title).toBe(input.title);
 
 	const originalEditor = { scope, taskId: task.id, expectedRevision: 1 };
-	expect(service.edit(originalEditor, input, "user", true).serial).toBe(claim.task.serial);
+	expect(service.edit(originalEditor, input, "user", { preserveTitle: true }).serial).toBe(claim.task.serial);
 	expect(service.settle({ scope, taskId: task.id, claimId: claim.claimId, state: "queued" }).state).toBe(
 		"queued",
 	);
@@ -50,6 +50,42 @@ test("adds generated titles without invalidating a claim or overwriting later ma
 	service.saveGeneratedTitle(scope, manual.id, "Late model output");
 	expect(service.get(scope, manual.id).title).toBe("Explicit title");
 	expect(service.history(scope, manual.id)[1]?.title).toBe(input.title);
+});
+
+test("splits a title-only instruction without losing its text, history or active claim", () => {
+	const { service, scope } = harness();
+	const original = "Vérifier la facture. Garde le montant exact, puis compare-le au reçu.";
+	const input = taskInput.parse({ title: original, body: "  " });
+	const task = service.createFromPanel(scope, randomUUID(), input).task;
+	const claim = service.claim({ scope, taskId: task.id, expectedSerial: task.serial, assignee: "thread" });
+	service.saveGeneratedTitle(scope, task.id, "Vérifier la facture", true);
+	expect(service.get(scope, task.id)).toMatchObject({
+		title: "Vérifier la facture",
+		body: original,
+		serial: claim.task.serial,
+	});
+	expect(service.history(scope, task.id)[0]).toMatchObject({ title: original, body: input.body });
+	const unchanged = service.edit({ scope, taskId: task.id, expectedRevision: 1 }, input, "user", {
+		preserveTitle: true,
+		preserveBody: true,
+	});
+	expect(unchanged.serial).toBe(claim.task.serial);
+	expect(service.settle({ scope, taskId: task.id, claimId: claim.claimId, state: "queued" }).state).toBe(
+		"queued",
+	);
+	const command = { scope, taskId: task.id, expectedRevision: 1 };
+	expect(() => service.edit(command, input, "user", { appendBody: "x".repeat(32768) })).toThrow(
+		"invalid_context",
+	);
+	const appended = service.edit(command, input, "user", {
+		preserveTitle: true,
+		appendBody: "Capture jointe",
+	});
+	expect(appended).toMatchObject({
+		title: "Vérifier la facture",
+		body: `${original}\n\nCapture jointe`,
+		revision: 2,
+	});
 });
 
 test("keeps user revisions, code whitespace and exact attachment bytes after restart", () => {

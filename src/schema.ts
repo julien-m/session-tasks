@@ -52,6 +52,12 @@ CREATE TABLE IF NOT EXISTS task_generated_title (
   PRIMARY KEY(task_id,revision),
   FOREIGN KEY(task_id,revision) REFERENCES task_revision(task_id,revision)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS task_title_split (
+  task_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision=1),
+  PRIMARY KEY(task_id,revision),
+  FOREIGN KEY(task_id,revision) REFERENCES task_generated_title(task_id,revision)
+) STRICT;
 CREATE TABLE IF NOT EXISTS attachment (
   task_id TEXT NOT NULL REFERENCES task(id),
   id TEXT NOT NULL CHECK(length(id)=36),
