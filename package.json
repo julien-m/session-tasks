@@ -1,0 +1,38 @@
+{
+	"name": "session-tasks",
+	"version": "0.4.2",
+	"description": "A persistent per-chat task queue for Codex Desktop",
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run tests --testTimeout 2000",
+		"check": "biome check . && npm run typecheck && npm test",
+		"build": "node scripts/build.mjs",
+		"package": "npm run build && node scripts/package.mjs",
+		"start": "node dist/http-server.mjs",
+		"verify-mcp": "node scripts/verify-mcp.mjs",
+		"verify-live-add": "node scripts/verify-live-add.mjs"
+	},
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"type": "module",
+	"private": true,
+	"dependencies": {
+		"@modelcontextprotocol/core": "2.4.0",
+		"@modelcontextprotocol/ext-apps": "2.0.3",
+		"@modelcontextprotocol/node": "2.1.2",
+		"@modelcontextprotocol/server": "2.4.0",
+		"zod": "4.6.7"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.6.8",
+		"@modelcontextprotocol/client": "2.4.0",
+		"@types/node": "26.6.6",
+		"esbuild": "0.28.2",
+		"typescript": "7.0.2",
+		"vitest": "5.1.1"
+	},
+	"engines": {
+		"node": ">=22.18"
+	}
+}

@@ -1,0 +1,6 @@
+{
+	"files": { "includes": ["**", "!!dist", "!!.native-patch", "!!artifacts", "!!package-lock.json"] },
+	"formatter": { "enabled": true, "indentStyle": "tab", "lineWidth": 110 },
+	"linter": { "enabled": true },
+	"assist": { "enabled": true }
+}
