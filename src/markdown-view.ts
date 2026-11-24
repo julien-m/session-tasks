@@ -1,8 +1,12 @@
 import MarkdownIt from "markdown-it";
 
-const markdown = new MarkdownIt({ html: false, breaks: true });
+const markdown = new MarkdownIt({ html: false, breaks: true, linkify: true });
+const linkComparison = new MarkdownIt({ html: false, linkify: true });
+// Parse destinations for comparison even when the display cannot open them.
+linkComparison.validateLink = () => true;
 type Token = ReturnType<typeof markdown.parse>[number];
-type OpenLink = (url: string) => void;
+type OpenLink = (url: string) => boolean;
+const linkProtocols = new Set(["http:", "https:", "mailto:", "tel:"]);
 
 const containers = new Set([
 	"p",
@@ -27,25 +31,74 @@ const containers = new Set([
 	"td",
 ]);
 
-function link(token: Token, openLink: OpenLink): HTMLElement {
-	const href = String(token.attrGet("href") ?? "");
-	const url = /^https?:\/\//i.test(href) ? URL.parse(href) : null;
-	if (!url) {
-		const label = document.createElement("span");
-		label.title = href;
-		return label;
-	}
+function linkUrl(token: Token): URL | undefined {
+	return allowedUrl(String(token.attrGet("href") ?? ""));
+}
+
+function allowedUrl(value: string): URL | undefined {
+	const url = URL.parse(value);
+	if (url && linkProtocols.has(url.protocol)) return url;
+}
+
+export function keepsMarkdownLinks(original: string, formatted: string): boolean {
+	const tokenLinks = (token: Token): string[] => {
+		if (token.type === "link_open" || token.type === "image") {
+			const destination = String(token.attrGet(token.type === "image" ? "src" : "href") ?? "");
+			return [`${token.type}:${allowedUrl(destination)?.href ?? destination}`];
+		}
+		if (token.children) return token.children.flatMap(tokenLinks);
+		if (token.type === "code_inline" || token.type === "fence" || token.type === "code_block")
+			return (markdown.linkify.match(token.content) ?? []).map(
+				({ url }) => `link_open:${allowedUrl(url)?.href ?? url}`,
+			);
+		return [];
+	};
+	const targets = (source: string) => [
+		...linkComparison.parse(source, {}).flatMap(tokenLinks),
+		...(source.match(/\bfile:\/{1,3}[^\s<>"'`()[\]]+/giu) ?? []),
+	];
+	const before = targets(original);
+	const after = targets(formatted);
+	return before.length === after.length && before.every((url, index) => after[index] === url);
+}
+
+function anchorFor(url: URL, openLink: OpenLink): HTMLAnchorElement {
 	const anchor = document.createElement("a");
 	anchor.href = url.href;
 	anchor.target = "_blank";
 	anchor.rel = "noopener noreferrer";
 	anchor.addEventListener("click", (event) => {
-		event.preventDefault();
-		openLink(url.href);
+		if (openLink(url.href)) event.preventDefault();
+	});
+	anchor.addEventListener("auxclick", (event) => {
+		if (event.button === 1 && openLink(url.href)) event.preventDefault();
 	});
 	return anchor;
 }
 
+function link(token: Token, openLink: OpenLink): HTMLElement {
+	const url = linkUrl(token);
+	if (url) return anchorFor(url, openLink);
+	const label = document.createElement("span");
+	label.title = String(token.attrGet("href") ?? "");
+	return label;
+}
+
+export function renderLinkableText(target: HTMLElement, source: string, openLink: OpenLink): void {
+	const content = document.createDocumentFragment();
+	let cursor = 0;
+	for (const match of markdown.linkify.match(source) ?? []) {
+		const url = allowedUrl(match.url);
+		if (!url) continue;
+		content.append(source.slice(cursor, match.index));
+		const anchor = anchorFor(url, openLink);
+		anchor.textContent = source.slice(match.index, match.lastIndex);
+		content.append(anchor);
+		cursor = match.lastIndex;
+	}
+	content.append(source.slice(cursor));
+	target.replaceChildren(content);
+}
 function appendTokens(
 	root: DocumentFragment | HTMLElement,
 	tokens: readonly Token[],
@@ -89,7 +142,7 @@ function appendTokens(
 			case "fence":
 			case "code_block": {
 				const code = document.createElement("code");
-				code.textContent = token.content;
+				renderLinkableText(code, token.content, openLink);
 				if (token.type === "code_inline") {
 					parent.append(code);
 					break;

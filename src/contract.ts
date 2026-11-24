@@ -31,6 +31,21 @@ export const state = z.enum(["queued", "running", "blocked", "done", "cancelled"
 export const actor = z.enum(["agent", "user"]);
 export const boardFilter = z.enum(["all", "remaining", "blocked", "done", "cancelled"]);
 export type BoardFilter = z.infer<typeof boardFilter>;
+export const panelViewFilters = ["remaining", "blocked", "done", "cancelled"] as const;
+export const boardPanelView = z
+	.object({
+		tab: z.number().int().min(0).max(2),
+		filters: z.array(z.enum(panelViewFilters)).max(3),
+		instructionHistory: z.boolean(),
+		cursor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+		scrollTop: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+	})
+	.strict()
+	.refine(
+		({ filters }) =>
+			new Set(filters).size === filters.length && (!filters.includes("cancelled") || filters.length === 1),
+	);
+export type BoardPanelView = z.output<typeof boardPanelView>;
 export const MAX_BOARD_INSTRUCTIONS_BYTES = 4096;
 export const boardInstructionsBody = textBytes(MAX_BOARD_INSTRUCTIONS_BYTES);
 const instructionDocument = z.object({
@@ -50,11 +65,27 @@ export interface BoardInstructions {
 }
 export const instructionEntryId = z.union([id, z.enum(["chat", "permanent"])]);
 export const instructionProjectId = z.uuid();
+export const instructionTarget = z.discriminatedUnion("kind", [
+	z.object({ kind: z.literal("chat") }).strict(),
+	z.object({ kind: z.literal("global") }).strict(),
+	z.object({ kind: z.literal("project"), projectId: instructionProjectId }).strict(),
+]);
+export type InstructionTarget = z.infer<typeof instructionTarget>;
+export type InstructionBinding = InstructionTarget | { kind: "other_chat" };
 export interface InstructionProject {
 	id: string;
 	name: string;
 	chatCount?: number;
 }
+export const MAX_INSTRUCTION_TARGETS = 100;
+const distinctInstructionTargets = (values: InstructionTarget[]): boolean =>
+	new Set(values.map((target) => (target.kind === "project" ? target.projectId : target.kind))).size ===
+	values.length;
+export const instructionTargets = z
+	.array(instructionTarget)
+	.max(MAX_INSTRUCTION_TARGETS)
+	.refine(distinctInstructionTargets);
+
 export const instructionEntryWrite = z
 	.object({
 		entryId: instructionEntryId,
@@ -62,8 +93,14 @@ export const instructionEntryWrite = z
 		body: boardInstructionsBody.refine((body) => Boolean(body.trim())),
 		permanent: z.boolean(),
 		projectId: instructionProjectId.optional(),
+		targets: instructionTargets.optional(),
+		replaceTargetsFrom: z.array(instructionTarget).refine(distinctInstructionTargets).optional(),
 	})
-	.refine(({ permanent, projectId }) => !permanent || !projectId);
+	.refine(({ permanent, projectId }) => !permanent || !projectId)
+	.refine(
+		({ replaceTargetsFrom, targets, expectedRevision }) =>
+			replaceTargetsFrom === undefined || (expectedRevision > 0 && Boolean(targets?.length)),
+	);
 export type InstructionEntryWrite = z.infer<typeof instructionEntryWrite>;
 export interface InstructionEntry {
 	id: z.infer<typeof instructionEntryId>;
@@ -71,8 +108,11 @@ export interface InstructionEntry {
 	body: string;
 	permanent: boolean;
 	projectId?: string;
+	bindings?: InstructionBinding[];
+	createdAt?: number;
 }
-export const commentBody = textBytes(8192).refine((value) => value.trim().length > 0);
+export const MAX_COMMENT_BYTES = 8192;
+export const commentBody = textBytes(MAX_COMMENT_BYTES).refine((value) => value.trim().length > 0);
 export const manualCheck = textBytes(1200).refine((value) => value.trim().length > 0);
 export const receipt = textBytes(8192).refine((value) => value.trim().length > 0);
 const verificationText = textBytes(1500).refine((value) => value.trim().length > 0);
@@ -122,6 +162,14 @@ export const taskInput = z
 			value.keep.length + value.files.length <= MAX_FILES && new Set(value.keep).size === value.keep.length,
 	);
 
+export const commentContent = z
+	.object({
+		body: textBytes(MAX_COMMENT_BYTES),
+		files: taskInput.shape.files,
+	})
+	.strict()
+	.refine(({ body, files }) => Boolean(body.trim()) || files.length > 0);
+
 export type TaskInput = z.output<typeof taskInput>;
 export type Actor = z.output<typeof actor>;
 export type State = z.output<typeof state>;
@@ -167,6 +215,9 @@ export interface Task extends Revision {
 	verification?: Verification;
 	manualValidation?: string;
 	updatedAt: number;
+	firstCreatedAt?: number;
+	completedAt?: number;
+	completedAtEstimated?: boolean;
 }
 
 export interface TaskComment {
@@ -176,12 +227,19 @@ export interface TaskComment {
 	kind: "comment" | "blocker";
 	body: string;
 	createdAt: number;
+	attachments?: Attachment[];
 }
 
 export type TaskSummary = Pick<
 	Task,
 	"id" | "ordinal" | "serial" | "revision" | "title" | "mode" | "state" | "assignee"
-> & { attachmentCount: number; blockedReason: string | null };
+> & {
+	attachmentCount: number;
+	blockedReason: string | null;
+	firstCreatedAt?: number;
+	completedAt?: number;
+	completedAtEstimated?: boolean;
+};
 
 export class TaskError extends Error {
 	constructor(

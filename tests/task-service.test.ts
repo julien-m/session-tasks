@@ -6,10 +6,17 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, test } from "vitest";
 import { localCodexProjects } from "../src/codex-projects.ts";
-import { taskInput } from "../src/contract.ts";
+import {
+	boardPanelView,
+	instructionEntryWrite,
+	MAX_INSTRUCTION_TARGETS,
+	resumeCodePrefix,
+	taskInput,
+} from "../src/contract.ts";
 import { taskHook } from "../src/hook.ts";
+import { catalog } from "../src/messages.ts";
 import { openDatabase, TaskRepository } from "../src/repository.ts";
-import { SCHEMA } from "../src/schema.ts";
+import { MAX_STOP_PASSES, SCHEMA } from "../src/schema.ts";
 import { TaskService } from "../src/task-service.ts";
 
 const resources: Array<() => void> = [];
@@ -23,6 +30,221 @@ function harness(path = ":memory:") {
 	const service = new TaskService(new TaskRepository(database));
 	return { service, database, scope: service.bind(randomUUID()) };
 }
+
+test("stores panel preferences per chat and reads them back after reopening SQLite", () => {
+	const folder = mkdtempSync(join(tmpdir(), "session-tasks-panel-view-"));
+	resources.push(() => rmSync(folder, { recursive: true, force: true }));
+	const path = join(folder, "tasks.sqlite3");
+	const { service, database, scope } = harness(path);
+	const other = service.bind(randomUUID());
+	const view = boardPanelView.parse({
+		tab: 1,
+		filters: ["remaining", "blocked"],
+		instructionHistory: true,
+		cursor: 52,
+		scrollTop: 235,
+	});
+	expect(service.readPanelView(scope)).toBeNull();
+	service.savePanelView(scope, view);
+	const reopened = harness(path).service;
+	expect(reopened.readPanelView(scope)).toEqual(view);
+	expect(reopened.readPanelView(other)).toBeNull();
+	expect(() => reopened.readPanelView(randomUUID())).toThrow();
+	expect(boardPanelView.safeParse({ ...view, filters: ["remaining", "cancelled"] }).success).toBe(false);
+	expect(() => database.prepare("UPDATE board_panel_view SET filters=9 WHERE scope=?").run(scope)).toThrow();
+});
+
+test("the Stop hook checks newly queued work and unread comments during its continuation, within a fixed budget", () => {
+	const { service } = harness();
+	const chat = randomUUID();
+	const scope = service.bind(chat);
+	const other = service.bind(randomUUID());
+	const stop = (active = false) =>
+		taskHook(service, { hook_event_name: "Stop", session_id: chat, stop_hook_active: active });
+	const add = (title: string, board = scope) =>
+		service.create(board, randomUUID(), taskInput.parse({ title }), "user");
+
+	expect(stop()).toEqual({});
+	const first = add("First task");
+	expect(stop()).toMatchObject({ decision: "block" });
+	add("Other chat", other);
+	expect(stop(true)).toEqual({});
+	add("New task during the stop review");
+	expect(stop(true)).toMatchObject({ decision: "block" });
+	expect(stop(true)).toEqual({});
+
+	const privateText = "Comment written during the continuation";
+	service.commentFromPanel(scope, first.id, randomUUID(), privateText, []);
+	const commentCheck = JSON.stringify(stop(true));
+	expect(commentCheck).toContain("session_tasks_comment_notifications");
+	expect(commentCheck).not.toContain(privateText);
+	expect(MAX_STOP_PASSES).toBe(3);
+	add("Another task after the stop budget is spent");
+	expect(stop(true)).toEqual({});
+
+	taskHook(service, { hook_event_name: "UserPromptSubmit", session_id: chat, prompt: "Reprendre" });
+	expect(stop(true)).toMatchObject({ decision: "block" });
+});
+
+test("notifies only the owning chat about a new panel comment and retains it until reviewed", () => {
+	const folder = mkdtempSync(join(tmpdir(), "session-tasks-comment-notification-"));
+	resources.push(() => rmSync(folder, { recursive: true, force: true }));
+	const path = join(folder, "tasks.sqlite3");
+	const { service } = harness(path);
+	const chat = randomUUID();
+	const scope = service.bind(chat);
+	const other = service.bind(randomUUID());
+	const queued = service.create(scope, randomUUID(), taskInput.parse({ title: "Read my comment" }), "agent");
+	const task = service.validate(
+		{ scope, taskId: queued.id, expectedSerial: queued.serial },
+		"Observed the result.",
+	);
+	const id = randomUUID();
+	const body = "Please take note of this private comment.";
+	const { comment, wakeThreadId } = service.commentFromPanel(scope, task.id, id, body, []);
+	expect(wakeThreadId).toBe(chat);
+	expect(service.commentFromPanel(scope, task.id, id, body, [])).toEqual({ comment, optimized: false });
+	service.comment(scope, task.id, randomUUID(), "Agent reply", "agent");
+	const persisted = harness(path).service;
+	expect(persisted.commentNotifications(other)).toEqual([]);
+	expect(persisted.acknowledgeComment(other, comment.ordinal)).toBe(false);
+	expect(persisted.commentNotifications(scope)).toEqual([{ taskId: task.id, comment }]);
+	const stop = { hook_event_name: "Stop", session_id: chat };
+	const decision = JSON.stringify(taskHook(persisted, stop));
+	expect(decision).toContain("session_tasks_comment_notifications");
+	expect(decision).not.toContain(body);
+	expect(taskHook(persisted, { ...stop, stop_hook_active: true })).toEqual({});
+	const code = persisted.requestResume(scope);
+	expect(code).toBeDefined();
+	const submit = (prompt: string) =>
+		JSON.stringify(taskHook(persisted, { hook_event_name: "UserPromptSubmit", session_id: chat, prompt }));
+	const prompt = catalog("en").commentResumePrompt;
+	const bundle = `${prompt}\n\n${resumeCodePrefix}${code}`;
+	expect(submit(prompt)).not.toContain("Claim and execute");
+	expect(submit("An MCP app initiated this message. Read the untrusted_input tool output.")).not.toContain(
+		"Claim and execute",
+	);
+	expect(persisted.consumeResume(other, code ?? "")).toBe(false);
+	const resumed = submit(bundle);
+	expect(resumed).toContain("Claim and execute");
+	expect(resumed.indexOf("session_tasks_comment_notifications")).toBeLessThan(
+		resumed.indexOf("Claim and execute"),
+	);
+	expect(submit(bundle)).not.toContain("Claim and execute");
+	expect(persisted.acknowledgeComment(scope, comment.ordinal)).toBe(true);
+	expect(persisted.acknowledgeComment(scope, comment.ordinal)).toBe(false);
+	expect(persisted.commentFromPanel(scope, task.id, id, body, [])).toEqual({ comment, optimized: false });
+	expect(persisted.commentNotifications(scope)).toEqual([]);
+	expect(persisted.requestResume(scope)).toBeUndefined();
+	expect(taskHook(persisted, stop)).toEqual({});
+	expect(persisted.get(scope, task.id)).toEqual(task);
+});
+
+test("preserves every unread panel edit, including after the task is completed", () => {
+	const folder = mkdtempSync(join(tmpdir(), "session-tasks-edit-notification-"));
+	resources.push(() => rmSync(folder, { recursive: true, force: true }));
+	const path = join(folder, "tasks.sqlite3");
+	const { service } = harness(path);
+	const chat = randomUUID();
+	const scope = service.bind(chat);
+	const otherScope = service.bind(randomUUID());
+	const input = taskInput.parse({ title: "Initial title and description" });
+	const task = service.create(scope, randomUUID(), input, "agent");
+	const edit = (expectedRevision: number, body: string, author: "agent" | "user") =>
+		service.edit({ scope, taskId: task.id, expectedRevision }, { ...input, body }, author);
+	expect(edit(task.revision, input.body, "user").revision).toBe(task.revision);
+	service.saveGeneratedTitle(scope, task.id, "Generated title", true);
+	const firstEdit = service.edit(
+		{ scope, taskId: task.id, expectedRevision: task.revision },
+		{ ...input, files: [{ name: "note.txt", mime: "text/plain", data: "bm90ZQ==" }] },
+		"user",
+		{ preserveTitle: true, preserveBody: true },
+	);
+	const secondEdit = edit(firstEdit.revision, "Second panel edit", "user");
+	const agentEdit = edit(secondEdit.revision, "Agent wording", "agent");
+	const done = service.validate(
+		{ scope, taskId: task.id, expectedSerial: agentEdit.serial },
+		"Checked the final result.",
+	);
+	const reopened = harness(path).service;
+	expect(reopened.pendingNotifications(scope)).toEqual({ pendingEdits: true });
+	expect(reopened.nextEditNotification(otherScope)).toBeNull();
+	expect(reopened.acknowledgeEdit(otherScope, task.id, firstEdit.revision)).toBe(false);
+	expect(reopened.nextEditNotification(scope)).toMatchObject({
+		taskId: task.id,
+		before: { revision: task.revision, title: "Generated title", body: input.title },
+		after: {
+			revision: firstEdit.revision,
+			title: "Generated title",
+			body: input.title,
+			attachments: [{ name: "note.txt" }],
+		},
+	});
+	expect(reopened.history(scope, task.id).at(-1)).toMatchObject({ title: input.title, body: "" });
+	expect(reopened.requestResume(scope)).toBeDefined();
+	expect(JSON.stringify(taskHook(reopened, { hook_event_name: "Stop", session_id: chat }))).toContain(
+		"session_tasks_edit_notifications",
+	);
+	expect(reopened.acknowledgeEdit(scope, task.id, firstEdit.revision)).toBe(true);
+	expect(reopened.acknowledgeEdit(scope, task.id, firstEdit.revision)).toBe(false);
+	expect(reopened.nextEditNotification(scope)).toMatchObject({
+		before: { revision: firstEdit.revision, body: firstEdit.body },
+		after: { revision: secondEdit.revision, body: secondEdit.body },
+	});
+	expect(reopened.acknowledgeEdit(scope, task.id, secondEdit.revision)).toBe(true);
+	expect(reopened.nextEditNotification(scope)).toBeNull();
+	expect(reopened.pendingNotifications(scope)).toEqual({});
+	expect(reopened.get(scope, task.id)).toEqual(done);
+});
+
+test("records user approval atomically when a blocked task is queued again", () => {
+	const { service, scope } = harness();
+	const task = service.create(scope, randomUUID(), taskInput.parse({ title: "Wait for approval" }), "agent");
+	const { claimId } = service.claim({
+		scope,
+		taskId: task.id,
+		expectedSerial: task.serial,
+		assignee: "thread",
+	});
+	const receipt = "Waiting for your approval.";
+	const blocked = service.settle({ scope, taskId: task.id, claimId, state: "blocked", receipt });
+	const approval = "I authorize Codex to resume this task.\n\nUse the attached result.";
+	const command = { scope, taskId: task.id, expectedSerial: blocked.serial };
+	expect(() => service.requeue(command)).toThrow("invalid_state");
+	const takenId = randomUUID();
+	service.comment(scope, task.id, takenId, "An unrelated comment", "agent");
+	expect(() => service.unblock(command, takenId, approval)).toThrow("conflict");
+	expect(service.get(scope, task.id)).toEqual(blocked);
+	expect(service.pendingNotifications(scope)).toEqual({});
+	const commentId = randomUUID();
+	const resumed = service.unblock(command, commentId, approval);
+	expect(resumed.task).toMatchObject({ state: "queued", revision: task.revision, receipt: null });
+	expect(resumed.wakeThreadId).toBeTruthy();
+	expect(() => service.unblock(command, commentId, approval)).toThrow("conflict");
+	expect(service.commentNotifications(scope)).toMatchObject([
+		{ taskId: task.id, comment: { id: commentId, author: "user", body: approval } },
+	]);
+	expect(service.comments(scope, task.id).comments).toEqual(
+		expect.arrayContaining([expect.objectContaining({ kind: "blocker", author: "agent", body: receipt })]),
+	);
+	expect(service.requestResume(scope)).toBeDefined();
+	const unread = service.commentNotifications(scope)[0];
+	if (!unread) throw new Error("missing approval notification");
+	expect(service.acknowledgeComment(scope, unread.comment.ordinal)).toBe(true);
+	const secondClaim = service.claim({ ...command, expectedSerial: resumed.task.serial, assignee: "thread" });
+	const secondBlock = service.settle({
+		scope,
+		taskId: task.id,
+		claimId: secondClaim.claimId,
+		state: "blocked",
+		receipt: "Waiting for a second confirmation.",
+	});
+	expect(() =>
+		service.unblock({ ...command, expectedSerial: secondBlock.serial }, commentId, approval),
+	).toThrow("conflict");
+	expect(service.get(scope, task.id)).toEqual(secondBlock);
+	expect(service.pendingNotifications(scope)).toEqual({});
+});
 
 test("adds generated titles without invalidating a claim or overwriting later manual edits", () => {
 	const { service, scope } = harness();
@@ -547,6 +769,93 @@ test("applies original instructions and only displays the current, scoped reform
 	expect(service.listInstructionEntries(other, true)).toEqual([]);
 });
 
+test("replaces edited instruction targets atomically without detaching another chat", () => {
+	const { service, scope } = harness();
+	const other = service.bind(randomUUID());
+	const unrelated = service.bind(randomUUID());
+	const entryId = randomUUID();
+	const global = { kind: "global" } as const;
+	const chat = { kind: "chat" } as const;
+	const source = { entryId, expectedRevision: 0, body: "Preserve this instruction.", permanent: false };
+	const first = service.saveInstructionEntry(scope, { ...source, targets: [chat] });
+	service.setInstructionBindings(other, entryId, first.revision, [chat], true);
+	const move = { ...source, expectedRevision: first.revision, targets: [global], replaceTargetsFrom: [chat] };
+	const changed = service.saveInstructionEntry(scope, move);
+	expect(changed.bindings).toEqual([{ kind: "other_chat" }, global]);
+	expect(service.listInstructionEntries(unrelated).map((entry) => entry.id)).toContain(entryId);
+	expect(() => service.saveInstructionEntry(scope, move)).toThrow("conflict");
+	const local = service.saveInstructionEntry(scope, {
+		...move,
+		expectedRevision: changed.revision,
+		targets: [chat],
+		replaceTargetsFrom: [global],
+	});
+	expect(local.bindings).toContainEqual(chat);
+	expect(local.bindings).toContainEqual({ kind: "other_chat" });
+	expect(service.listInstructionEntries(other).map((entry) => entry.id)).toContain(entryId);
+	expect(service.listInstructionEntries(unrelated).map((entry) => entry.id)).not.toContain(entryId);
+	service.setInstructionBindings(scope, entryId, local.revision, [global], true);
+	expect(() =>
+		service.saveInstructionEntry(scope, {
+			...move,
+			expectedRevision: local.revision,
+			targets: [global],
+			replaceTargetsFrom: [chat],
+		}),
+	).toThrow("conflict");
+});
+
+test("does not revive an older optimization when editing the scope of new instruction text", () => {
+	const { service, scope } = harness();
+	const entryId = randomUUID();
+	const chat = { kind: "chat" } as const;
+	const global = { kind: "global" } as const;
+	const first = service.saveInstructionEntry(scope, {
+		entryId,
+		expectedRevision: 0,
+		body: "Old instructions.",
+		permanent: false,
+		targets: [chat],
+	});
+	service.saveInstructionReformulation(scope, entryId, first.revision, {
+		title: "Old title",
+		body: "Old formatted version.",
+	});
+	const changed = service.saveInstructionEntry(scope, {
+		entryId,
+		expectedRevision: first.revision,
+		body: "New instructions.",
+		permanent: false,
+		targets: [],
+	});
+	const moved = service.saveInstructionEntry(scope, {
+		entryId,
+		expectedRevision: changed.revision,
+		body: changed.body,
+		permanent: false,
+		targets: [global],
+		replaceTargetsFrom: [chat],
+	});
+	expect(moved.body).toBe("New instructions.");
+	expect(moved.reformulation).toBeUndefined();
+});
+
+test("allows replacing a scope assembled from several batches of project bindings", () => {
+	const previous = Array.from({ length: MAX_INSTRUCTION_TARGETS + 1 }, () => ({
+		kind: "project" as const,
+		projectId: randomUUID(),
+	}));
+	const write = {
+		entryId: randomUUID(),
+		expectedRevision: 1,
+		body: "Preserve this instruction.",
+		permanent: false,
+		replaceTargetsFrom: previous,
+	};
+	expect(instructionEntryWrite.safeParse({ ...write, targets: [{ kind: "chat" }] }).success).toBe(true);
+	expect(instructionEntryWrite.safeParse({ ...write, targets: previous }).success).toBe(false);
+});
+
 test("keeps Markdown wrappers around an instruction at the source byte limit", () => {
 	const { service, scope } = harness();
 	const entryId = randomUUID();
@@ -662,4 +971,346 @@ test("applies a project instruction only to current members, including after a c
 	expect(service.listInstructionEntries(other)[0]?.body).toBe(body);
 	service.removeInstructionEntry(owner, entryId, 2, true);
 	expect(service.listInstructionEntries(other)).toEqual([]);
+});
+
+test("keeps comment files attached to their comment through retries and restart", () => {
+	const folder = mkdtempSync(join(tmpdir(), "session-task-comment-"));
+	resources.push(() => rmSync(folder, { recursive: true, force: true }));
+	const path = join(folder, "tasks.sqlite3");
+	const { service, scope } = harness(path);
+	const foreign = service.bind(randomUUID());
+	const task = service.create(
+		scope,
+		randomUUID(),
+		taskInput.parse({ title: "Comment with context" }),
+		"user",
+	);
+	const file = { name: "notes.md", mime: "text/markdown", data: Buffer.from("**Notes**").toString("base64") };
+	const commentId = randomUUID();
+	const result = service.comment(scope, task.id, commentId, "", "user", [file]);
+	expect(result.body).toBe("");
+	const attachmentId = result.attachments?.[0]?.id;
+	if (!attachmentId) throw new Error("missing comment attachment");
+	expect(service.comment(scope, task.id, commentId, "", "user", [file])).toEqual(result);
+	expect(() => service.comment(scope, task.id, commentId, "", "user", [{ ...file, data: "eA==" }])).toThrow(
+		"conflict",
+	);
+	expect(() => service.comment(foreign, task.id, randomUUID(), "", "user", [file])).toThrow("not_found");
+	expect(() => service.file(foreign, task.id, attachmentId)).toThrow("not_found");
+	expect(service.get(scope, task.id)).toEqual(task);
+	const reopened = harness(path).service;
+	expect(reopened.comments(scope, task.id).comments).toEqual([result]);
+	expect(Buffer.from(reopened.file(scope, task.id, attachmentId).data).toString("base64")).toBe(file.data);
+});
+
+test("replaces a comment with its reformulation while accepting a retry of the original submission", () => {
+	const folder = mkdtempSync(join(tmpdir(), "session-tasks-comment-format-"));
+	resources.push(() => rmSync(folder, { recursive: true, force: true }));
+	const path = join(folder, "tasks.sqlite3");
+	const { service, scope, database } = harness(path);
+	const task = service.create(
+		scope,
+		randomUUID(),
+		taskInput.parse({ title: "Keep the source comment" }),
+		"user",
+	);
+	const id = randomUUID();
+	const original = "j'ai lance npm test, ok [preuve](https://example.test/passed)";
+	const formatted = "J’ai lancé `npm test` avec succès. [Preuve](https://example.test/passed)";
+	service.comment(scope, task.id, id, original, "user");
+	const foreign = service.bind(randomUUID());
+	expect(() => service.saveCommentReformulation(foreign, task.id, id, formatted)).toThrow("not_found");
+	service.saveCommentReformulation(scope, task.id, id, "");
+	service.saveCommentReformulation(scope, task.id, id, "Report: [preuve](https://example.test/wrong)");
+	expect(service.comments(scope, task.id).comments[0]?.body).toBe(original);
+	service.saveCommentReformulation(scope, task.id, id, formatted);
+	service.saveCommentReformulation(scope, task.id, id, "Late duplicate");
+	expect(database.prepare("SELECT body FROM task_comment WHERE id=?").get(id)?.body).toBe(formatted);
+	const reopened = harness(path).service;
+	expect(reopened.comments(scope, task.id).comments).toMatchObject([{ id, body: formatted, author: "user" }]);
+	expect(reopened.comment(scope, task.id, id, original, "user").body).toBe(formatted);
+	expect(() => reopened.comment(scope, task.id, id, "Changed source", "user")).toThrow("conflict");
+	expect(reopened.get(scope, task.id).serial).toBe(task.serial);
+});
+
+test("keeps unsupported links and image destinations safe before replacing a comment", () => {
+	const { service, scope } = harness();
+	const task = service.create(scope, randomUUID(), taskInput.parse({ title: "Links" }), "user");
+	const source =
+		"Compare [report](./old.md), [file](file:///tmp/original), ![chart](https://example.test/a) and `file:///tmp/code`.";
+	const id = randomUUID();
+	service.comment(scope, task.id, id, source, "user");
+	for (const [before, after] of [
+		["./old.md", "./different.md"],
+		["file:///tmp/original", "file:///tmp/different"],
+		["file:///tmp/code", "file:///tmp/other"],
+		["https://example.test/a", "https://example.test/b"],
+	] as const) {
+		service.saveCommentReformulation(scope, task.id, id, source.replace(before, after));
+		expect(service.comments(scope, task.id).comments[0]?.body).toBe(source);
+	}
+});
+
+test("consolidates legacy comment text without losing links, attachments or unread state", () => {
+	const folder = mkdtempSync(join(tmpdir(), "session-tasks-legacy-comments-"));
+	resources.push(() => rmSync(folder, { recursive: true, force: true }));
+	const path = join(folder, "tasks.sqlite3");
+	const { service, database, scope } = harness(path);
+	const task = service.create(scope, randomUUID(), taskInput.parse({ title: "Legacy task" }), "user");
+	const file = { name: "note.txt", mime: "text/plain", data: Buffer.from("note").toString("base64") };
+	const source = "[Test](https://example.test/result) ok";
+	const optimized = "[Test](https://example.test/result) réussi.";
+	const { comment: first } = service.commentFromPanel(scope, task.id, randomUUID(), source, [file]);
+	const { comment: second } = service.commentFromPanel(scope, task.id, randomUUID(), source, []);
+	database.exec(`CREATE TABLE comment_reformulation (
+		task_id TEXT NOT NULL, comment_id TEXT NOT NULL, body TEXT NOT NULL,
+		PRIMARY KEY(task_id,comment_id),
+		FOREIGN KEY(task_id,comment_id) REFERENCES task_comment(task_id,id) ON DELETE CASCADE
+	) STRICT;`);
+	const legacy = database.prepare("INSERT INTO comment_reformulation VALUES (?,?,?)");
+	legacy.run(task.id, first.id, optimized);
+	legacy.run(task.id, second.id, "[Test](https://example.test/different)");
+	const migrated = harness(path);
+	expect(migrated.service.commentNotifications(scope).map(({ comment }) => comment)).toEqual([
+		{ ...first, body: optimized },
+		second,
+	]);
+	expect(migrated.database.prepare("SELECT count(*) AS count FROM comment_reformulation").get()?.count).toBe(
+		0,
+	);
+	expect(migrated.database.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+	expect(migrated.service.commentFromPanel(scope, task.id, first.id, source, [file]).comment.body).toBe(
+		optimized,
+	);
+	expect(migrated.service.get(scope, task.id).serial).toBe(task.serial);
+});
+
+test("reuses instructions across projects and chats without losing their library history", () => {
+	const { database } = harness();
+	const one = randomUUID();
+	const two = randomUUID();
+	const oneThread = randomUUID();
+	const twoThread = randomUUID();
+	let now = 1;
+	const service = new TaskService(new TaskRepository(database), () => now, {
+		list: () => [
+			{ id: one, name: "Project One" },
+			{ id: two, name: "Project Two" },
+		],
+		forThread: (thread) => (thread === oneThread ? one : thread === twoThread ? two : undefined),
+	});
+	const boards = [service.bind(oneThread), service.bind(twoThread), service.bind(randomUUID())] as const;
+	const [first, second, other] = boards;
+	const shared = service.saveInstructionEntry(
+		first,
+		{
+			entryId: randomUUID(),
+			expectedRevision: 0,
+			body: "Shared instruction",
+			permanent: false,
+			targets: [
+				{ kind: "project", projectId: one },
+				{ kind: "project", projectId: two },
+			],
+		},
+		true,
+		true,
+	);
+	expect(service.listInstructionEntries(first).map(({ id }) => id)).toEqual([shared.id]);
+	expect(service.listInstructionEntries(second).map(({ id }) => id)).toEqual([shared.id]);
+	expect(service.listInstructionEntries(other)).toEqual([]);
+	now = 10;
+	const newest = service.saveInstructionEntry(
+		first,
+		{
+			entryId: randomUUID(),
+			expectedRevision: 0,
+			body: "Latest instruction",
+			permanent: false,
+			targets: [{ kind: "chat" }],
+		},
+		true,
+		true,
+	);
+	expect(service.listInstructionLibrary(other).map(({ id }) => id)).toEqual([newest.id, shared.id]);
+	expect(service.listInstructionLibrary(other)[0]?.bindings).toEqual([{ kind: "other_chat" }]);
+	service.setInstructionBindings(
+		first,
+		shared.id,
+		shared.revision,
+		[{ kind: "project", projectId: one }],
+		false,
+	);
+	expect(service.listInstructionEntries(first).map(({ id }) => id)).toEqual([newest.id]);
+	expect(service.listInstructionEntries(second).map(({ id }) => id)).toEqual([shared.id]);
+	service.setInstructionBindings(
+		second,
+		shared.id,
+		shared.revision,
+		[{ kind: "project", projectId: two }],
+		false,
+	);
+	expect(service.listInstructionEntries(second)).toEqual([]);
+	expect(service.listInstructionLibrary(other).find(({ id }) => id === shared.id)).toMatchObject({
+		body: shared.body,
+		bindings: [],
+	});
+	service.setInstructionBindings(other, shared.id, shared.revision, [{ kind: "chat" }], true);
+	expect(service.listInstructionEntries(other).map(({ id }) => id)).toEqual([shared.id]);
+	service.setInstructionBindings(other, shared.id, shared.revision, [{ kind: "global" }], true);
+	expect(service.listInstructionEntries(other).map(({ id }) => id)).toEqual([shared.id]);
+	expect(service.listInstructionEntries(second).map(({ id }) => id)).toEqual([shared.id]);
+});
+
+test("deletes only an unbound instruction at the confirmed revision and rejects stale writes", () => {
+	const { service, database, scope } = harness();
+	const other = service.bind(randomUUID());
+	const entryId = randomUUID();
+	const draft = {
+		entryId,
+		expectedRevision: 0,
+		body: "Keep this instruction until its last assignment is removed.",
+		permanent: false,
+		targets: [{ kind: "chat" }] as const,
+	};
+	service.saveInstructionEntry(scope, { ...draft, targets: [...draft.targets] });
+	service.setInstructionBindings(other, entryId, 1, [{ kind: "chat" }], true);
+	service.setInstructionBindings(scope, entryId, 1, [{ kind: "chat" }], false);
+	expect(() => service.deleteUnboundInstruction(scope, entryId, 1)).toThrow("conflict");
+	service.setInstructionBindings(other, entryId, 1, [{ kind: "chat" }], false);
+	expect(() => service.deleteUnboundInstruction(scope, entryId, 2)).toThrow("conflict");
+	service.saveInstructionReformulation(
+		scope,
+		entryId,
+		1,
+		{ title: "Keep the instruction", body: draft.body },
+		true,
+	);
+	service.deleteUnboundInstruction(scope, entryId, 1);
+	service.saveInstructionReformulation(scope, entryId, 1, { title: "Late response", body: draft.body }, true);
+	expect(service.listInstructionLibrary(scope)).toEqual([]);
+	expect(
+		database.prepare("SELECT body,removed,revision FROM instruction_entry WHERE id=?").get(entryId),
+	).toEqual({
+		body: "",
+		removed: 1,
+		revision: 2,
+	});
+	expect(
+		database.prepare("SELECT entry_id FROM instruction_reformulation WHERE entry_id=?").get(entryId),
+	).toBeUndefined();
+	expect(() => service.setInstructionBindings(scope, entryId, 1, [{ kind: "chat" }], true)).toThrow(
+		"conflict",
+	);
+	expect(() => service.saveInstructionEntry(scope, { ...draft, targets: [...draft.targets] })).toThrow(
+		"conflict",
+	);
+});
+
+test("serves the last task page, an earlier cursor and the latest Codex-authored task", () => {
+	const { service, scope } = harness();
+	let lastAgentOrdinal = 0;
+	for (let index = 0; index < 52; index++) {
+		const author = index % 2 === 0 ? "agent" : "user";
+		const task = service.create(scope, randomUUID(), taskInput.parse({ title: `Task ${index}` }), author);
+		if (author === "agent") lastAgentOrdinal = task.ordinal;
+	}
+	const tail = service.list(scope, 0, [], true, { tail: true });
+	expect(tail.tasks).toHaveLength(2);
+	expect(tail.tasks[0]?.title).toBe("Task 50");
+	expect(tail.tasks.at(-1)?.title).toBe("Task 51");
+	expect(tail.next).toBeNull();
+	expect(tail.viewport).toMatchObject({ latestAgentOrdinal: lastAgentOrdinal, previousAfter: 0 });
+});
+
+test("preserves the first creation and actual finish times through verification and reopening", () => {
+	const { database } = harness();
+	let now = 1000;
+	const service = new TaskService(new TaskRepository(database), () => now);
+	const scope = service.bind(randomUUID());
+	const task = service.create(scope, randomUUID(), taskInput.parse({ title: "Measure task timing" }), "user");
+	expect(task.firstCreatedAt).toBe(1000);
+	now = 2000;
+	const claimed = service.claim({ scope, taskId: task.id, expectedSerial: task.serial, assignee: "thread" });
+	now = 3000;
+	const done = service.settle({
+		scope,
+		taskId: task.id,
+		claimId: claimed.claimId,
+		state: "done",
+		verification: { work: "Worked", check: "Checked", result: "Passed", evidence: "Test receipt" },
+	});
+	expect(done.completedAt).toBe(3000);
+	now = 4000;
+	const checked = service.validate(
+		{ scope, taskId: task.id, expectedSerial: done.serial },
+		"Checked visually",
+	);
+	expect(checked.completedAt).toBe(3000);
+	expect(service.list(scope).tasks[0]?.completedAt).toBe(3000);
+	database.prepare("DELETE FROM task_completion WHERE task_id=?").run(task.id);
+	expect(service.get(scope, task.id)).toMatchObject({ completedAt: 4000, completedAtEstimated: true });
+	now = 5000;
+	const reopened = service.requeue({ scope, taskId: task.id, expectedSerial: checked.serial });
+	expect(reopened.completedAt).toBeUndefined();
+	now = 6000;
+	const doneAgain = service.validate(
+		{ scope, taskId: task.id, expectedSerial: reopened.serial },
+		"Checked again",
+	);
+	expect(doneAgain.firstCreatedAt).toBe(1000);
+	expect(doneAgain.completedAt).toBe(6000);
+});
+
+test("archives existing legacy documents while retaining their assignment and old-editor revision", () => {
+	const folder = mkdtempSync(join(tmpdir(), "session-task-migrate-instructions-"));
+	resources.push(() => rmSync(folder, { recursive: true, force: true }));
+	const path = join(folder, "tasks.sqlite3");
+	const old = new DatabaseSync(path);
+	old.exec(SCHEMA);
+	const scope = randomUUID();
+	old.prepare("INSERT INTO board VALUES(?,?)").run(randomUUID(), scope);
+	old.prepare("INSERT INTO board_instructions VALUES(?,?,?)").run(scope, 3, "Legacy in one chat");
+	old.prepare("INSERT INTO permanent_instructions VALUES(1,?,?)").run(4, "Legacy everywhere");
+	old.close();
+	const { service, scope: other } = harness(path);
+	const history = service.listInstructionLibrary(other);
+	const local = history.find((entry) => entry.body === "Legacy in one chat");
+	if (!local) throw new Error("migrated chat instruction is missing");
+	expect(local.bindings).toEqual([{ kind: "other_chat" }]);
+	expect(service.readInstructions(scope)).toEqual({
+		chat: { revision: 3, body: "Legacy in one chat" },
+		permanent: { revision: 4, body: "Legacy everywhere" },
+	});
+	service.saveInstructions(scope, { chat: { revision: 3, body: "Legacy edited" } });
+	expect(service.listInstructionEntries(scope).map(({ body }) => body)).toContain("Legacy edited");
+	expect(service.listInstructionLibrary(other).find(({ id }) => id === local.id)?.body).toBe("Legacy edited");
+	service.setInstructionBindings(scope, local.id, 4, [{ kind: "chat" }], false);
+	expect(service.readInstructions(scope).chat).toEqual({ revision: 4, body: "" });
+	expect(service.listInstructionLibrary(other).find(({ id }) => id === local.id)?.body).toBe("Legacy edited");
+	service.deleteUnboundInstruction(scope, local.id, 4);
+	expect(service.readInstructions(scope).chat).toEqual({ revision: 5, body: "" });
+	expect(() => service.saveInstructions(scope, { chat: { revision: 4, body: "Stale editor" } })).toThrow(
+		"conflict",
+	);
+	service.saveInstructions(scope, { chat: { revision: 5, body: "A new legacy entry" } });
+	expect(service.readInstructions(scope).chat).toEqual({ revision: 6, body: "A new legacy entry" });
+	expect(service.listInstructionLibrary(scope).some(({ id }) => id === local.id)).toBe(false);
+	service.saveInstructions(other, { chat: { revision: 0, body: "Another old client" } });
+	const latest = service.saveInstructionEntry(
+		other,
+		{
+			entryId: "chat",
+			expectedRevision: 1,
+			body: "Another old client edited",
+			permanent: false,
+			targets: [],
+		},
+		true,
+		true,
+	);
+	expect(latest.bindings).toEqual([{ kind: "chat" }]);
+	expect(service.listInstructionEntries(other).map(({ body }) => body)).toContain(
+		"Another old client edited",
+	);
 });

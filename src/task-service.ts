@@ -8,8 +8,10 @@ import {
 	type BoardFilter,
 	type BoardInstructions,
 	commentBody,
+	commentContent,
 	type InstructionChanges,
 	type InstructionEntryWrite,
+	type InstructionTarget,
 	instructionChanges,
 	instructionEntryWrite,
 	MAX_FILE_BYTES,
@@ -70,7 +72,7 @@ interface TaskCreation {
 }
 
 /** Decodes bounded file contents before opening a database transaction. */
-function decodeFiles(input: TaskInput): StoredFile[] {
+function decodeFiles(input: Pick<TaskInput, "files">): StoredFile[] {
 	let bytes = 0;
 	return input.files.map((file) => {
 		const data = Buffer.from(file.data, "base64");
@@ -94,16 +96,25 @@ export class TaskService {
 		return this.store.bind(threadId);
 	}
 
+	readPanelView(scope: string): ReturnType<TaskRepository["readPanelView"]> {
+		return this.store.readPanelView(scope);
+	}
+
+	savePanelView(scope: string, view: Parameters<TaskRepository["savePanelView"]>[1]): void {
+		this.store.savePanelView(scope, view);
+	}
+
 	/** Lists the current board without fetching any attachment bytes. */
 	list(
 		scope: string,
 		after = 0,
 		cancelled: boolean | BoardFilter | BoardFilter[] = false,
 		formatted = false,
+		viewport?: { tail: boolean },
 	): BoardList {
 		this.store.assertScope(scope);
 		const filter = typeof cancelled === "boolean" ? (cancelled ? "cancelled" : "active") : cancelled;
-		return this.store.list(scope, after, filter, formatted);
+		return this.store.list(scope, after, filter, formatted, viewport);
 	}
 
 	readInstructions(scope: string): BoardInstructions {
@@ -134,13 +145,48 @@ export class TaskService {
 	): PresentedInstruction {
 		const checked = instructionEntryWrite.safeParse(input);
 		if (!checked.success) throw new TaskError("invalid_context");
-		if (
-			checked.data.projectId &&
-			(!manageProjects ||
-				!this.listInstructionProjects(scope).some((project) => project.id === checked.data.projectId))
-		)
+		const projects =
+			checked.data.targets?.flatMap((target) => (target.kind === "project" ? [target.projectId] : [])) ??
+			(checked.data.projectId ? [checked.data.projectId] : []);
+		this.validateInstructionProjects(scope, projects, manageProjects);
+		return this.store.saveInstructionEntry(
+			scope,
+			checked.data,
+			materializeLegacy,
+			manageProjects,
+			this.now(),
+		);
+	}
+
+	listInstructionLibrary(scope: string): PresentedInstruction[] {
+		return this.store.listInstructionEntries(scope, true, undefined, true, true);
+	}
+
+	instructionProjectForScope(scope: string): string | undefined {
+		return this.projects?.forThread(this.store.threadForScope(scope));
+	}
+
+	setInstructionBindings(
+		scope: string,
+		entryId: string,
+		expectedRevision: number,
+		bindings: InstructionTarget[],
+		active: boolean,
+	): { entryId: string; revision: number } {
+		if (active)
+			this.validateInstructionProjects(
+				scope,
+				bindings.flatMap((binding) => (binding.kind === "project" ? [binding.projectId] : [])),
+				true,
+			);
+		return this.store.setInstructionBindings(scope, entryId, expectedRevision, bindings, active);
+	}
+
+	private validateInstructionProjects(scope: string, projects: string[], manageProjects: boolean): void {
+		if (!projects.length) return;
+		const available = new Set(this.listInstructionProjects(scope).map((project) => project.id));
+		if (!manageProjects || projects.some((project) => !available.has(project)))
 			throw new TaskError("invalid_context");
-		return this.store.saveInstructionEntry(scope, checked.data, materializeLegacy, manageProjects);
 	}
 
 	saveInstructionReformulation(
@@ -148,9 +194,15 @@ export class TaskService {
 		entryId: string,
 		revision: number,
 		result: Reformulation,
+		library = false,
 	): void {
 		const checked = reformulation.safeParse(result);
-		if (checked.success) this.store.saveInstructionReformulation(scope, entryId, revision, checked.data);
+		if (checked.success)
+			this.store.saveInstructionReformulation(scope, entryId, revision, checked.data, library);
+	}
+
+	deleteUnboundInstruction(scope: string, entryId: string, expectedRevision: number): void {
+		this.store.deleteUnboundInstruction(scope, entryId, expectedRevision);
 	}
 
 	removeInstructionEntry(
@@ -195,6 +247,41 @@ export class TaskService {
 		);
 	}
 
+	clearStopCheckpoint(scope: string): void {
+		this.store.clearStopCheckpoint(scope);
+	}
+
+	checkpointStop(scope: string, continuation: boolean): ReturnType<TaskRepository["checkpointStop"]> {
+		return this.store.checkpointStop(scope, continuation);
+	}
+
+	pendingNotifications(scope: string): { pendingComments?: true; pendingEdits?: true } {
+		return {
+			...(this.store.hasCommentNotifications(scope) ? { pendingComments: true } : {}),
+			...(this.store.hasEditNotifications(scope) ? { pendingEdits: true } : {}),
+		};
+	}
+
+	commentNotifications(scope: string): ReturnType<TaskRepository["commentNotifications"]> {
+		this.store.assertScope(scope);
+		return this.store.commentNotifications(scope);
+	}
+
+	acknowledgeComment(scope: string, ordinal: number): boolean {
+		this.store.assertScope(scope);
+		return this.store.acknowledgeComment(scope, ordinal);
+	}
+
+	nextEditNotification(scope: string): ReturnType<TaskRepository["nextEditNotification"]> {
+		this.store.assertScope(scope);
+		return this.store.nextEditNotification(scope);
+	}
+
+	acknowledgeEdit(scope: string, taskId: string, revision: number): boolean {
+		this.store.assertScope(scope);
+		return this.store.acknowledgeEdit(scope, taskId, revision);
+	}
+
 	/** Records an explicit human check on the current task without an agent claim. */
 	validate(command: VersionedTask, observation: string): Task {
 		const checked = manualCheck.safeParse(observation);
@@ -234,13 +321,64 @@ export class TaskService {
 	}
 
 	/** Comments stay attached to the task without changing its instructions or work state. */
-	comment(scope: string, taskId: string, commentId: string, body: string, author: Actor): TaskComment {
+	comment(
+		scope: string,
+		taskId: string,
+		commentId: string,
+		body: string,
+		author: Actor,
+		files: TaskInput["files"] = [],
+	): TaskComment {
+		return this.insertComment(scope, taskId, commentId, body, author, files, false).comment;
+	}
+
+	commentFromPanel(
+		scope: string,
+		taskId: string,
+		commentId: string,
+		body: string,
+		files: TaskInput["files"],
+	): { comment: TaskComment; optimized: boolean; wakeThreadId?: string } {
+		return this.insertComment(scope, taskId, commentId, body, "user", files, true);
+	}
+
+	private insertComment(
+		scope: string,
+		taskId: string,
+		commentId: string,
+		body: string,
+		author: Actor,
+		files: TaskInput["files"],
+		notify: boolean,
+	): { comment: TaskComment; optimized: boolean; wakeThreadId?: string } {
+		const parsed = commentContent.safeParse({ body, files });
+		if (!parsed.success) throw new TaskError("invalid_state");
+		const decoded = decodeFiles(parsed.data);
 		return this.store.write(() => {
 			this.requireTask(scope, taskId);
-			const parsed = commentBody.safeParse(body);
-			if (!parsed.success) throw new TaskError("invalid_state");
-			return this.store.addComment(taskId, commentId, author, "comment", parsed.data, this.now());
+			const firstPending = notify && !this.store.hasCommentNotifications(scope);
+			const { comment, created, optimized } = this.store.addComment(
+				taskId,
+				commentId,
+				author,
+				"comment",
+				body.trim() ? body : "",
+				this.now(),
+				decoded,
+				notify,
+			);
+			return {
+				comment,
+				optimized,
+				...(firstPending && created ? { wakeThreadId: this.store.threadForScope(scope) } : {}),
+			};
 		});
+	}
+
+	saveCommentReformulation(scope: string, taskId: string, commentId: string, body: string): void {
+		this.requireTask(scope, taskId);
+		const parsed = commentBody.safeParse(body);
+		if (parsed.success) this.store.saveCommentReformulation(taskId, commentId, parsed.data);
 	}
 
 	comments(
@@ -343,6 +481,7 @@ export class TaskService {
 			if (unchanged) return this.store.task(row);
 			const now = this.now();
 			this.saveRevision(row.id, row.revision + 1, { ...input, title, body }, author, now, files);
+			if (author === "user") this.store.recordEditNotification(row.id, row.revision + 1);
 			this.store.update(command.scope, row.id, row, inactive("queued"), now, row.revision + 1);
 			if (title === row.title && body === row.body) {
 				const formatted = this.store.readReformulation(row.id, row.revision);
@@ -363,9 +502,32 @@ export class TaskService {
 	/** Requeues a task requested by the user, invalidating a potentially abandoned claim. */
 	requeue(command: VersionedTask): Task {
 		return this.mutate(command, (row) => {
-			if (row.state === "queued") throw new TaskError("invalid_state");
+			if (row.state === "queued" || row.state === "blocked") throw new TaskError("invalid_state");
 			this.store.update(command.scope, row.id, row, inactive("queued"), this.now());
 		});
+	}
+
+	/** Records the user's approval and releases the blocked task in the same transaction. */
+	unblock(command: VersionedTask, commentId: string, approval: string): { task: Task; wakeThreadId: string } {
+		const body = commentBody.safeParse(approval);
+		if (!body.success) throw new TaskError("invalid_state");
+		const task = this.mutate(command, (row) => {
+			if (row.state !== "blocked") throw new TaskError("invalid_state");
+			const now = this.now();
+			this.store.update(command.scope, row.id, row, inactive("queued"), now);
+			const { created } = this.store.addComment(
+				row.id,
+				commentId,
+				"user",
+				"comment",
+				body.data,
+				now,
+				[],
+				true,
+			);
+			if (!created) throw new TaskError("conflict");
+		});
+		return { task, wakeThreadId: this.store.threadForScope(command.scope) };
 	}
 
 	/** Takes one current queued revision for an agent or the parent chat. */

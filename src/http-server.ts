@@ -9,6 +9,7 @@ import manifest from "../plugin.json" with { type: "json" };
 import { localCodexProjects } from "./codex-projects.ts";
 import { MAX_UPLOAD_BYTES } from "./contract.ts";
 import { createTaskMcp } from "./mcp-tools.ts";
+import { QuickActions } from "./quick-actions.ts";
 import { openDatabase, TaskRepository } from "./repository.ts";
 import { DEFAULT_PORT, databasePath, HOST } from "./runtime.ts";
 import { TaskService } from "./task-service.ts";
@@ -21,9 +22,12 @@ const port = z.coerce
 	.parse(process.argv[2] ?? DEFAULT_PORT);
 const authority = `${HOST}:${port}`;
 const database = openDatabase(databasePath());
-const service = new TaskService(new TaskRepository(database), Date.now, localCodexProjects());
+const tasks = new TaskRepository(database);
+const projects = localCodexProjects();
+const service = new TaskService(tasks, Date.now, projects);
+const actions = new QuickActions(database, tasks, projects);
 const html = readFileSync(new URL("./tasks.html", import.meta.url), "utf8");
-const handler = createMcpHandler(() => createTaskMcp(service, html, manifest.version), {
+const handler = createMcpHandler(() => createTaskMcp(service, html, manifest.version, actions), {
 	maxRequestBodySize: Math.ceil((MAX_UPLOAD_BYTES * 4) / 3) + 131072,
 	maxSubscriptions: 8,
 });

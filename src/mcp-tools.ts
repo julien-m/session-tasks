@@ -5,37 +5,56 @@ import {
 	registerAppResource,
 	registerAppTool,
 } from "@modelcontextprotocol/ext-apps/server";
-import { type CallToolResult, McpServer } from "@modelcontextprotocol/server";
+import {
+	type CallToolResult,
+	McpServer,
+	ResourceNotFoundError,
+	ResourceTemplate,
+} from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { chatCanResume } from "./chat-activity.ts";
 import {
 	assignee,
 	boardFilter,
+	boardPanelView,
 	commentBody,
+	commentContent,
+	type InstructionEntryWrite,
 	id,
 	instructionChanges,
 	instructionEntryId,
 	instructionEntryWrite,
+	instructionTargets,
 	manualCheck,
 	receipt,
 	resumeCode,
 	serial,
 	type Task,
+	type TaskComment,
 	TaskError,
 	taskInput,
 	verification,
 } from "./contract.ts";
+import { catalog } from "./messages.ts";
+import type { QuickActions } from "./quick-actions.ts";
+import { quickActionBody, quickActionInput } from "./quick-actions-contract.ts";
 import type { TaskService } from "./task-service.ts";
 import {
+	isCommentFormatPending,
 	isInstructionReformulationFailed,
 	isReformulationPending,
 	isTitlePending,
+	scheduleActionSuggestion,
+	scheduleCommentFormat,
 	scheduleReformulation,
 	scheduleTaskTitle,
+	suggestQuickAction,
 	suggestTitle,
 } from "./title-suggestion.ts";
 
-const UI_URI = "ui://session-tasks/tasks.html";
+const LEGACY_UI_URI = "ui://session-tasks/tasks.html";
+const releaseOrder = new Intl.Collator("en", { numeric: true });
+const stableRelease = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
 const icon = readFileSync(new URL("../assets/session-tasks.png", import.meta.url), "base64");
 const icons = [{ src: `data:image/png;base64,${icon}`, mimeType: "image/png", sizes: ["64x64"] }];
 const scoped = z.object({ scope: id });
@@ -51,12 +70,18 @@ const move = identified.extend({ targetId: id, position: serial, targetPosition:
 const attachment = identified.extend({ attachmentId: id });
 const comment = identified.extend({ commentId: id, body: commentBody });
 const comments = identified.extend({ before: serial.optional() });
-const uiMeta = { resourceUri: UI_URI, visibility: ["app"] as ["app"] };
+const instructionLocale = z.enum(["en", "fr"]);
+const createInstruction = scoped.extend({
+	entryId: id.describe("Fresh UUIDv4. Reuse the exact ID for retries."),
+	body: instructionEntryWrite.shape.body,
+	targets: instructionTargets.min(1),
+	locale: instructionLocale.describe("Language for the generated title and formatted text."),
+});
 const localUi = { csp: { connectDomains: [], resourceDomains: [] } };
 const imageTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-const annotations = (readOnlyHint: boolean) => ({
+const annotations = (readOnlyHint: boolean, destructiveHint = false) => ({
 	readOnlyHint,
-	destructiveHint: false,
+	destructiveHint,
 	openWorldHint: false,
 });
 
@@ -85,8 +110,15 @@ function protection<T>(
 }
 
 /** Makes fresh protocol handlers per HTTP request against the shared task service. */
-export function createTaskMcp(service: TaskService, html: string, version: string): McpServer {
+export function createTaskMcp(
+	service: TaskService,
+	html: string,
+	version: string,
+	actions: QuickActions,
+): McpServer {
 	const server = new McpServer({ name: "session-tasks", version, icons });
+	const resourceUri = `ui://session-tasks/tasks-${encodeURIComponent(version)}.html`;
+	const uiMeta = { resourceUri, visibility: ["app"] as ["app"] };
 	const agent = <T>(
 		name: string,
 		description: string,
@@ -105,20 +137,137 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		inputSchema: z.ZodType<T>,
 		readOnly: boolean,
 		action: (args: T) => object | Promise<object>,
+		destructive = false,
 	) => {
 		registerAppTool(
 			server,
 			name,
-			{ inputSchema, annotations: annotations(readOnly), _meta: { ui: uiMeta } },
+			{ inputSchema, annotations: annotations(readOnly, destructive), _meta: { ui: uiMeta } },
 			protection(async (args: T) => result(await action(args), false)),
 		);
 	};
+	const actionIdentity = scoped.extend({ actionId: id });
+	panel("task_panel_view", scoped, true, ({ scope }) => ({ view: service.readPanelView(scope) }));
+	panel("task_panel_save_view", scoped.extend({ view: boardPanelView }), false, ({ scope, view }) => {
+		service.savePanelView(scope, view);
+		return { saved: true };
+	});
+	const actionVersion = actionIdentity.extend({ revision: serial });
+	panel("task_panel_actions", scoped, true, ({ scope }) => ({
+		actions: actions.list(scope).map(({ body: _, ...item }) => ({
+			...item,
+			...(isReformulationPending(item.id, item.revision, "action") ? { optimizing: true } : {}),
+		})),
+		projects: service.listInstructionProjects(scope),
+	}));
+	panel("task_panel_get_action", actionIdentity, true, ({ scope, actionId }) => actions.get(scope, actionId));
+	panel(
+		"task_panel_save_action",
+		actionIdentity.extend({
+			expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+			input: quickActionInput,
+			optimize: z.object({ locale: instructionLocale, suggestColor: z.boolean() }).optional(),
+		}),
+		false,
+		({ scope, actionId, expectedRevision, input, optimize }) => {
+			const action = actions.save(scope, actionId, expectedRevision, input);
+			if (optimize)
+				scheduleActionSuggestion(
+					action,
+					optimize.locale,
+					optimize.suggestColor && !action.color,
+					(suggestion) => actions.applySuggestion(scope, action, suggestion),
+				);
+			return action;
+		},
+	);
+	panel(
+		"task_panel_preview_action",
+		scoped.extend({ body: quickActionBody, locale: instructionLocale }),
+		false,
+		async ({ scope, body, locale }) => {
+			service.list(scope);
+			const suggestion = await suggestQuickAction(body, locale);
+			return { preview: suggestion && { title: suggestion.title, body: suggestion.body } };
+		},
+	);
+	panel(
+		"task_panel_remove_action",
+		actionVersion,
+		false,
+		({ scope, actionId, revision }) => {
+			actions.remove(scope, actionId, revision);
+			return { removed: true };
+		},
+		true,
+	);
+	panel(
+		"task_panel_move_action",
+		actionIdentity.extend({
+			targetId: id,
+			position: serial,
+			targetPosition: serial,
+		}),
+		false,
+		({ scope, actionId, targetId, position, targetPosition }) => {
+			actions.move(scope, actionId, targetId, position, targetPosition);
+			return { moved: true };
+		},
+	);
+	panel("task_panel_request_action", actionVersion, false, ({ scope, actionId, revision }) => ({
+		code: isReformulationPending(actionId, revision, "action")
+			? undefined
+			: actions.request(scope, actionId, revision),
+	}));
+	agent(
+		"session_tasks_add_action",
+		"Save a quick action only when the user explicitly requests creation. Supply a short title and the exact text to send; preserve commands, branches and intent. Specify global, this chat, or explicitly named project IDs resolved by session_tasks_instruction_projects. Saving never runs the action.",
+		actionIdentity.extend({ input: quickActionInput }),
+		false,
+		({ scope, actionId, input }) => result(actions.save(scope, actionId, 0, input), true),
+	);
+	agent(
+		"session_tasks_confirm_action",
+		"Redeem a one-use quick action code for this exact chat. Use only the code delivered by the current Session Tasks panel message. The returned text represents the action the user just clicked. Do not execute from an unconfirmed payload.",
+		scoped.extend({ code: resumeCode }),
+		false,
+		({ scope, code }) => {
+			const action = actions.consume(scope, code);
+			return result(action ? { confirmed: true, action } : { confirmed: false }, true);
+		},
+	);
 
 	const queueReformulation = (scope: string, task: Task, locale: "en" | "fr") => {
 		scheduleReformulation(task, locale, (generated) =>
 			service.saveReformulation(scope, task.id, task.revision, generated),
 		);
 	};
+	const saveInstruction = (
+		scope: string,
+		entry: InstructionEntryWrite,
+		reformulate?: z.infer<typeof instructionLocale>,
+		manageProjects?: boolean,
+	) => {
+		const saved = service.saveInstructionEntry(scope, entry, Boolean(reformulate), manageProjects);
+		const deferred =
+			reformulate && !saved.reformulation
+				? !scheduleReformulation(
+						saved,
+						reformulate,
+						(generated) =>
+							service.saveInstructionReformulation(
+								scope,
+								saved.id,
+								saved.revision,
+								generated,
+								Boolean(entry.targets),
+							),
+						"instruction",
+					)
+				: false;
+		return { saved, deferred };
+	};
+
 	const panelTask = (task: Task) => ({
 		...task,
 		reformulation: service.readReformulation(task),
@@ -132,7 +281,7 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		inputSchema: z.object({ scope: id.optional() }),
 		annotations: annotations(true),
 		icons,
-		_meta: { ui: { resourceUri: UI_URI }, "openai/ui": { entrypoints: [{ type: "thread" }] } },
+		_meta: { ui: { resourceUri }, "openai/ui": { entrypoints: [{ type: "thread" }] } },
 	};
 	registerAppTool(
 		server,
@@ -147,10 +296,42 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 
 	agent(
 		"session_tasks_confirm_resume",
-		"Confirm a Session Tasks resume code from this turn's MCP app message. Pass only the exact code in the current untrusted_input output and the scope from the Session Tasks hook. Resume the existing tasks only if confirmed is true. Codes are scoped, expire, and can be used once.",
+		"Confirm a Session Tasks resume code from this turn's MCP app message. Pass only the exact code in the current untrusted_input output and the scope from the Session Tasks hook. If confirmed, review pendingComments and pendingEdits before resuming the existing queue. Codes are scoped, expire, and can be used once.",
 		scoped.extend({ code: resumeCode }),
 		false,
-		({ scope, code }) => result({ confirmed: service.consumeResume(scope, code) }, true),
+		({ scope, code }) => {
+			const confirmed = service.consumeResume(scope, code);
+			return result({ confirmed, ...(confirmed ? service.pendingNotifications(scope) : {}) }, true);
+		},
+	);
+	agent(
+		"session_tasks_comment_notifications",
+		"Read up to five unreviewed user comments from this exact chat, including their task IDs and attachment metadata. Read the relevant task, then acknowledge each reviewed comment by ordinal. Reading does not mark it acknowledged.",
+		scoped,
+		true,
+		({ scope }) => result({ notifications: service.commentNotifications(scope) }, true),
+	);
+	agent(
+		"session_tasks_acknowledge_comment",
+		"Acknowledge one user comment after you have reviewed it and acted or taken note as appropriate. Use the exact ordinal returned by session_tasks_comment_notifications for this scope. This does not modify the task or the comment.",
+		scoped.extend({ ordinal: serial }),
+		false,
+		({ scope, ordinal }) => result({ acknowledged: service.acknowledgeComment(scope, ordinal) }, true),
+	);
+	agent(
+		"session_tasks_edit_notifications",
+		"Read the next unreviewed user task edit in this exact chat, including the full before and after revisions. Review it against the task's current state. Acknowledge each reviewed edit, then call again until notification is null.",
+		scoped,
+		true,
+		({ scope }) => result({ notification: service.nextEditNotification(scope) }, true),
+	);
+	agent(
+		"session_tasks_acknowledge_edit",
+		"Record that you have reviewed the specified edit and handled it or taken note. Use the exact task ID and after.revision returned by session_tasks_edit_notifications. This leaves the task and its history intact.",
+		identified.extend({ revision: serial }),
+		false,
+		({ scope, taskId, revision }) =>
+			result({ acknowledged: service.acknowledgeEdit(scope, taskId, revision) }, true),
 	);
 	agent(
 		"session_tasks_add",
@@ -161,7 +342,7 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 	);
 	agent(
 		"session_tasks_list",
-		"Read current queue and counts for the exact hook-provided scope; check after each task, before dispatch and before ending. Read task details only when acting on the task.",
+		"Read current queue and counts for the exact hook-provided scope; check after each task, before dispatch and before ending. When pendingComments or pendingEdits is true, review them via session_tasks_comment_notifications or session_tasks_edit_notifications. Read task details only when acting on the task.",
 		list,
 		true,
 		({ scope, after, cancelled }) => {
@@ -169,6 +350,7 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 			return result(
 				{
 					...page,
+					...service.pendingNotifications(scope),
 					tasks: page.tasks.map(
 						({ id, ordinal, position, title, serial, revision, state, mode, assignee }) => ({
 							id,
@@ -201,6 +383,36 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		true,
 		({ scope }) => result({ instructions: service.listInstructionEntries(scope) }, true),
 	);
+	agent(
+		"session_tasks_instruction_projects",
+		"List the local Codex project names and IDs when the user asks to assign an instruction to projects. Use exact IDs from this list. Clarify ambiguous matches before writing.",
+		scoped,
+		true,
+		({ scope }) =>
+			result(
+				{ projects: service.listInstructionProjects(scope).map(({ id, name }) => ({ id, name })) },
+				true,
+			),
+	);
+	agent(
+		"session_tasks_add_instruction",
+		"Create one saved instruction only when the user explicitly requests it. Preserve the user's wording. Supply explicit targets for this chat, the named projects, or all chats only when the user explicitly requests that global scope. Resolve projects with session_tasks_instruction_projects first. Use a new UUID and keep it for retries. The title and display text are generated in the background.",
+		createInstruction,
+		false,
+		({ scope, entryId, body, targets, locale }) => {
+			const { saved, deferred } = saveInstruction(
+				scope,
+				{ entryId, expectedRevision: 0, body, permanent: false, targets },
+				locale,
+				true,
+			);
+			return result(
+				{ entryId: saved.id, revision: saved.revision, bindings: saved.bindings, deferred },
+				true,
+			);
+		},
+	);
+
 	agent(
 		"session_tasks_move",
 		"Move a queued task to another queued task's position to respect a user priority or a concrete prerequisite. Use the exact current positions from session_tasks_list. Moving upward inserts before the target, and moving downward inserts after it. Record the concrete reason on the affected task.",
@@ -294,12 +506,17 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 
 	panel(
 		"task_panel_list",
-		list.extend({ filter: boardFilter.optional(), filters: z.array(boardFilter).max(5).optional() }),
+		list.extend({
+			filter: boardFilter.optional(),
+			filters: z.array(boardFilter).max(5).optional(),
+			tail: z.boolean().optional(),
+		}),
 		true,
-		({ scope, after, cancelled, filter, filters }) => {
-			const page = service.list(scope, after, filters ?? filter ?? cancelled, true);
+		({ scope, after, cancelled, filter, filters, tail }) => {
+			const page = service.list(scope, after, filters ?? filter ?? cancelled, true, { tail: Boolean(tail) });
 			return {
 				...page,
+				...service.pendingNotifications(scope),
 				tasks: page.tasks.map((task) =>
 					task.state !== "cancelled" &&
 					(isReformulationPending(task.id, task.revision) || (task.revision === 1 && isTitlePending(task.id)))
@@ -329,24 +546,50 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 			reformulationFailed: isInstructionReformulationFailed(entry.id, entry.revision),
 		})),
 	}));
+	panel("task_panel_instruction_library", scoped, true, ({ scope }) => ({
+		projectId: service.instructionProjectForScope(scope),
+		instructions: service.listInstructionLibrary(scope).map((entry) => ({
+			...entry,
+			reformulationPending: isReformulationPending(entry.id, entry.revision, "instruction"),
+			reformulationFailed: isInstructionReformulationFailed(entry.id, entry.revision),
+		})),
+	}));
+	panel(
+		"task_panel_instruction_binding",
+		scoped.extend({
+			entryId: instructionEntryId,
+			expectedRevision: serial,
+			bindings: instructionTargets.min(1),
+			active: z.boolean(),
+		}),
+		false,
+		({ scope, entryId, expectedRevision, bindings, active }) => {
+			return {
+				saved: true,
+				...service.setInstructionBindings(scope, entryId, expectedRevision, bindings, active),
+			};
+		},
+	);
 	panel(
 		"task_panel_save_instruction_entry",
-		manageInstructions.extend({ entry: instructionEntryWrite, reformulate: z.enum(["en", "fr"]).optional() }),
+		manageInstructions.extend({ entry: instructionEntryWrite, reformulate: instructionLocale.optional() }),
 		false,
 		({ scope, entry, reformulate, manageProjects }) => {
-			const saved = service.saveInstructionEntry(scope, entry, Boolean(reformulate), manageProjects);
-			const deferred =
-				reformulate && !saved.reformulation
-					? !scheduleReformulation(
-							saved,
-							reformulate,
-							(generated) => service.saveInstructionReformulation(scope, saved.id, saved.revision, generated),
-							"instruction",
-						)
-					: false;
+			const { saved, deferred } = saveInstruction(scope, entry, reformulate, manageProjects);
 			return { saved: true, entryId: saved.id, deferred };
 		},
 	);
+	panel(
+		"task_panel_delete_unbound_instruction",
+		scoped.extend({ entryId: id, expectedRevision: serial }),
+		false,
+		({ scope, entryId, expectedRevision }) => {
+			service.deleteUnboundInstruction(scope, entryId, expectedRevision);
+			return { deleted: true };
+		},
+		true,
+	);
+
 	panel(
 		"task_panel_remove_instruction_entry",
 		manageInstructions.extend({ entryId: instructionEntryId, expectedRevision: serial }),
@@ -428,18 +671,53 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 	panel("task_panel_cancel", versioned, false, (command) => service.cancel(command));
 	panel("task_panel_restore", versioned, false, (command) => service.requeue(command));
 	panel(
+		"task_panel_unblock",
+		versioned.extend({ commentId: id, response: z.string().max(1200), locale: instructionLocale }),
+		false,
+		async ({ commentId, response, locale, ...command }) => {
+			const approval = catalog(locale).unblockApproval;
+			const { task, wakeThreadId } = service.unblock(
+				command,
+				commentId,
+				response.trim() ? `${approval}\n\n${response}` : approval,
+			);
+			return { ...task, wake: await chatCanResume(wakeThreadId) };
+		},
+	);
+	panel(
 		"task_panel_validate",
 		versioned.extend({ observation: manualCheck }),
 		false,
 		({ observation, ...command }) => service.validate(command, observation),
 	);
-	panel("task_panel_comment", comment, false, ({ scope, taskId, commentId, body }) =>
-		service.comment(scope, taskId, commentId, body, "user"),
+	const panelComment = (taskId: string, comment: TaskComment) => ({
+		...comment,
+		...(isCommentFormatPending(taskId, comment.id) ? { formatting: true } : {}),
+	});
+	panel(
+		"task_panel_comment",
+		identified.extend({ commentId: id, ...commentContent.shape, format: z.boolean().optional() }),
+		false,
+		async ({ scope, taskId, commentId, body, files, format }) => {
+			const {
+				comment: saved,
+				optimized,
+				wakeThreadId,
+			} = service.commentFromPanel(scope, taskId, commentId, body, files);
+			if (format && saved.body && !optimized)
+				scheduleCommentFormat(taskId, commentId, saved.body, (formatted) =>
+					service.saveCommentReformulation(scope, taskId, commentId, formatted),
+				);
+			const wake = wakeThreadId !== undefined && (await chatCanResume(wakeThreadId));
+			return { ...panelComment(taskId, saved), ...(wake ? { wake: true } : {}) };
+		},
 	);
 	panel("task_panel_comments", comments, true, ({ scope, taskId, before }) => {
 		const task = service.get(scope, taskId);
+		const page = service.comments(scope, taskId, before);
 		return {
-			...service.comments(scope, taskId, before),
+			...page,
+			comments: page.comments.map((comment) => panelComment(taskId, comment)),
 			reformulationPending: isReformulationPending(task.id, task.revision),
 			hasReformulation: Boolean(service.readReformulation(task)),
 		};
@@ -455,7 +733,7 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		return { id: file.id, name: file.name, mime: file.mime, data: Buffer.from(file.data).toString("base64") };
 	});
 
-	registerAppResource(server, "Session Tasks", UI_URI, { _meta: { ui: localUi } }, async (uri) => ({
+	const readPanel = async (uri: URL) => ({
 		contents: [
 			{
 				uri: uri.href,
@@ -467,6 +745,30 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 				},
 			},
 		],
-	}));
+	});
+	registerAppResource(server, "Session Tasks", resourceUri, { _meta: { ui: localUi } }, readPanel);
+	// Older tool catalogs still reference the original URI.
+	registerAppResource(
+		server,
+		"Session Tasks (compatibility)",
+		LEGACY_UI_URI,
+		{ _meta: { ui: localUi } },
+		readPanel,
+	);
+	server.registerResource(
+		"Session Tasks (previous releases)",
+		new ResourceTemplate("ui://session-tasks/tasks-{release}.html", { list: undefined }),
+		{ mimeType: RESOURCE_MIME_TYPE, _meta: { ui: localUi } },
+		(uri, { release }) => {
+			if (
+				typeof release !== "string" ||
+				!stableRelease.test(release) ||
+				releaseOrder.compare(release, version) >= 0
+			) {
+				throw new ResourceNotFoundError(uri.href);
+			}
+			return readPanel(uri);
+		},
+	);
 	return server;
 }

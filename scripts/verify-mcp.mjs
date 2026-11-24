@@ -32,14 +32,41 @@ const success = async (name, args) => {
 await client.connect(transport, limits);
 try {
 	const catalog = await client.listTools({}, limits);
+	const discoverProjects = catalog.tools.find((tool) => tool.name === "session_tasks_instruction_projects");
+	assert.equal(discoverProjects?.annotations?.readOnlyHint, true);
+	const addInstruction = catalog.tools.find((tool) => tool.name === "session_tasks_add_instruction");
+	assert.equal(addInstruction?.annotations?.readOnlyHint, false);
+	const projects = await success("session_tasks_instruction_projects", {});
+	assert.ok(Array.isArray(projects.structuredContent.projects));
 	const opener = catalog.tools.find((tool) => tool.name === "open_session_tasks");
 	assert.ok(opener?._meta.ui.resourceUri);
 	assert.match(opener.icons?.[0]?.src ?? "", /^data:image\/png;base64,/);
-	const page = await client.readResource({ uri: "ui://session-tasks/tasks.html" }, limits);
+	const { version } = await (await fetch(new URL("/health", endpoint))).json();
+	assert.equal(opener._meta.ui.resourceUri, `ui://session-tasks/tasks-${version}.html`);
+	const page = await client.readResource({ uri: opener._meta.ui.resourceUri }, limits);
+	const legacyPage = await client.readResource({ uri: "ui://session-tasks/tasks.html" }, limits);
+	assert.equal(page.contents[0].text, legacyPage.contents[0].text);
+	const priorPanel = await client.readResource({ uri: "ui://session-tasks/tasks-0.5.19.html" }, limits);
+	assert.equal(page.contents[0].text, priorPanel.contents[0].text);
+	const [major, minor, patch] = version.split(".");
+	const futurePanel = `ui://session-tasks/tasks-${major}.${minor}.${Number(patch) + 1}.html`;
+	await assert.rejects(client.readResource({ uri: futurePanel }, limits));
 	assert.equal(page.contents[0].mimeType, "text/html;profile=mcp-app");
 	assert.equal(page.contents[0]._meta["openai/ui"].preferredDisplayMode, "fullscreen");
 	const launch = await success("open_session_tasks", {});
 	assert.equal(launch._meta.binding, scope);
+	assert.deepEqual((await success("task_panel_view", {})).structuredContent, { view: null });
+	const panelView = {
+		tab: 2,
+		filters: ["remaining", "blocked"],
+		instructionHistory: true,
+		cursor: 0,
+		scrollTop: 12,
+	};
+	assert.deepEqual((await success("task_panel_save_view", { view: panelView })).structuredContent, {
+		saved: true,
+	});
+	assert.deepEqual((await success("task_panel_view", {})).structuredContent, { view: panelView });
 	const first = (
 		await success("task_panel_create", {
 			taskId,
@@ -72,7 +99,10 @@ try {
 	]);
 	assert.equal(confirmation.filter((result) => result.structuredContent.confirmed).length, 1);
 	assert.equal((await success("session_tasks_confirm_resume", { code })).structuredContent.confirmed, false);
-	assert.equal(hook("Stop").decision, "block");
+	const stopWithWork = hook("Stop");
+	assert.equal(stopWithWork.decision, "block");
+	assert.match(stopWithWork.reason, /creation step does not cancel the preceding execution request/u);
+	assert.match(stopWithWork.reason, /explicitly limited the request to planning or recording/u);
 	assert.deepEqual(hook("Stop", { stop_hook_active: true }), {});
 	const taking = (
 		await success("session_tasks_claim", { taskId, expectedSerial: first.serial, assignee: "example-worker" })
@@ -120,6 +150,8 @@ try {
 	};
 	const done = (await success("session_tasks_settle", { ...settle, verification })).structuredContent;
 	assert.deepEqual(done.verification, verification);
+	assert.equal(done.firstCreatedAt, first.firstCreatedAt);
+	assert.ok(done.completedAt >= done.firstCreatedAt);
 	assert.equal((await success("task_panel_list", {})).structuredContent.counts.done, 1);
 	const reopened = (await success("task_panel_restore", { taskId, expectedSerial: done.serial }))
 		.structuredContent;
@@ -149,6 +181,24 @@ try {
 		(await invoke("task_panel_comments", { scope: randomUUID(), taskId })).structuredContent.error,
 		"not_found",
 	);
+	const contextComment = {
+		taskId,
+		commentId: randomUUID(),
+		body: "",
+		files: [{ name: "comment-only.png", mime: "image/png", data: png }],
+	};
+	const withFile = (await success("task_panel_comment", contextComment)).structuredContent;
+	assert.equal(withFile.body, "");
+	assert.equal(withFile.attachments[0].name, "comment-only.png");
+	assert.deepEqual((await success("task_panel_comment", contextComment)).structuredContent, withFile);
+	assert.equal(
+		(await success("task_panel_file", { taskId, attachmentId: withFile.attachments[0].id })).structuredContent
+			.data,
+		png,
+	);
+	const library = await success("task_panel_instruction_library", {});
+	assert.ok(Array.isArray(library.structuredContent.instructions));
+	assert.ok(catalog.tools.some((tool) => tool.name === "task_panel_instruction_binding"));
 	assert.equal((await success("task_panel_get", { taskId })).structuredContent.serial, reopened.serial);
 	const observation = "I opened the fixture and saw the image in the detail panel.";
 	const manuallyDone = (
@@ -157,12 +207,144 @@ try {
 	assert.equal(manuallyDone.manualValidation, observation);
 	assert.equal((await success("task_panel_list", { filter: "remaining" })).structuredContent.tasks.length, 0);
 	assert.equal((await success("task_panel_list", { filter: "done" })).structuredContent.tasks[0].id, taskId);
+	const pending = (await success("session_tasks_comment_notifications", {})).structuredContent.notifications;
+	assert.deepEqual(
+		pending.map(({ taskId: id, comment }) => [id, comment.id]),
+		[
+			[taskId, userComment.structuredContent.id],
+			[taskId, withFile.id],
+		],
+	);
+	assert.match(hook("Stop").reason, /session_tasks_comment_notifications/u);
+	assert.deepEqual(hook("Stop", { stop_hook_active: true }), {});
+	const duringStop = (
+		await success("task_panel_comment", {
+			taskId,
+			commentId: randomUUID(),
+			body: "Late comment during the Stop continuation",
+			files: [],
+		})
+	).structuredContent;
+	const repeatedStop = hook("Stop", { stop_hook_active: true });
+	assert.equal(repeatedStop.decision, "block");
+	assert.match(repeatedStop.reason, /session_tasks_comment_notifications/u);
+	assert.deepEqual(hook("Stop", { stop_hook_active: true }), {});
+	const commentCode = (await success("task_panel_request_resume", {})).structuredContent.code;
+	assert.ok(commentCode);
+	hook("UserPromptSubmit", { prompt: wrapper });
+	assert.deepEqual((await success("session_tasks_confirm_resume", { code: commentCode })).structuredContent, {
+		confirmed: true,
+		pendingComments: true,
+		pendingEdits: true,
+	});
+	assert.deepEqual((await success("session_tasks_confirm_resume", { code: commentCode })).structuredContent, {
+		confirmed: false,
+	});
+	const { notification } = (await success("session_tasks_edit_notifications", {})).structuredContent;
+	assert.equal(notification.taskId, taskId);
+	assert.equal(notification.before.revision, first.revision);
+	assert.equal(notification.after.revision, revised.revision);
+	assert.equal(notification.after.title, revised.title);
+	const editAck = { taskId, revision: notification.after.revision };
+	assert.equal(
+		(await success("session_tasks_acknowledge_edit", editAck)).structuredContent.acknowledged,
+		true,
+	);
+	assert.equal(
+		(await success("session_tasks_acknowledge_edit", editAck)).structuredContent.acknowledged,
+		false,
+	);
+	assert.equal((await success("session_tasks_edit_notifications", {})).structuredContent.notification, null);
+	for (const comment of [...pending.map(({ comment }) => comment), duringStop])
+		assert.equal(
+			(await success("session_tasks_acknowledge_comment", { ordinal: comment.ordinal })).structuredContent
+				.acknowledged,
+			true,
+		);
+	assert.deepEqual(
+		(await success("session_tasks_comment_notifications", {})).structuredContent.notifications,
+		[],
+	);
 	await success("task_panel_cancel", { taskId, expectedSerial: manuallyDone.serial });
 	assert.deepEqual(hook("Stop"), {});
 	assert.equal((await success("task_panel_list", {})).structuredContent.tasks.length, 0);
 	assert.equal((await success("task_panel_list", { cancelled: true })).structuredContent.tasks.length, 1);
+	const blockedId = randomUUID();
+	const created = (
+		await success("task_panel_create", { taskId: blockedId, input: { title: "Wait for approval" } })
+	).structuredContent;
+	const blockedClaim = (
+		await success("session_tasks_claim", {
+			taskId: blockedId,
+			expectedSerial: created.serial,
+			assignee: "thread",
+		})
+	).structuredContent;
+	const blocker = "Waiting for human approval.";
+	const blocked = (
+		await success("session_tasks_settle", {
+			taskId: blockedId,
+			claimId: blockedClaim.claimId,
+			state: "blocked",
+			receipt: blocker,
+		})
+	).structuredContent;
+	const approval = {
+		taskId: blockedId,
+		expectedSerial: blocked.serial,
+		commentId: randomUUID(),
+		response: "Use the new result.",
+		locale: "en",
+	};
+	const released = (await success("task_panel_unblock", approval)).structuredContent;
+	assert.equal(released.state, "queued");
+	assert.equal(released.wake, false);
+	assert.equal((await invoke("task_panel_unblock", approval)).structuredContent.error, "conflict");
+	const notices = (await success("session_tasks_comment_notifications", {})).structuredContent.notifications;
+	assert.equal(notices.length, 1);
+	assert.equal(notices[0].taskId, blockedId);
+	assert.equal(notices[0].comment.body, "I authorize Codex to resume this task.\n\nUse the new result.");
+	assert(
+		(await success("task_panel_comments", { taskId: blockedId })).structuredContent.comments.some(
+			(comment) => comment.body === blocker,
+		),
+	);
+	await success("session_tasks_acknowledge_comment", { ordinal: notices[0].comment.ordinal });
+	await success("task_panel_cancel", { taskId: blockedId, expectedSerial: released.serial });
+	const actionId = randomUUID();
+	const actionInput = {
+		title: "Quick fixture",
+		body: "Respond only with fixture.\n",
+		audience: { kind: "chat" },
+		color: null,
+	};
+	const action = (await success("session_tasks_add_action", { actionId, input: actionInput }))
+		.structuredContent;
+	assert.equal(action.id, actionId);
+	assert.equal(
+		(await success("task_panel_actions", {})).structuredContent.actions.find((item) => item.id === actionId)
+			?.title,
+		actionInput.title,
+	);
+	const actionRequest = (await success("task_panel_request_action", { actionId, revision: action.revision }))
+		.structuredContent;
+	assert.match(actionRequest.code, /^[a-f0-9]{32}$/u);
+	assert.equal(
+		(await success("task_panel_request_action", { actionId, revision: action.revision })).structuredContent
+			.code,
+		undefined,
+	);
+	assert.deepEqual(
+		(await success("session_tasks_confirm_action", { code: actionRequest.code })).structuredContent,
+		{ confirmed: true, action: { title: actionInput.title, body: actionInput.body } },
+	);
+	assert.deepEqual(
+		(await success("session_tasks_confirm_action", { code: actionRequest.code })).structuredContent,
+		{ confirmed: false },
+	);
+	await success("task_panel_remove_action", { actionId, revision: action.revision });
 	console.log(
-		"Verified MCP discovery, hooks, attachments, history, completion evidence, reopening, scoped comments, manual validation, filters and cancellation.",
+		"Verified MCP discovery, hooks, attachments, history, completion evidence, reopening, scoped comments and notifications, manual validation, filters, cancellation, unblock approval and one-use action dispatch.",
 	);
 } finally {
 	await client.close();

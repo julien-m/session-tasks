@@ -31,7 +31,41 @@ import {
 	isInstructionReformulationFailed,
 	isReformulationPending,
 	scheduleReformulation,
+	suggestQuickAction,
 } from "../src/title-suggestion.ts";
+
+test("keeps the written command if a quick-action preview drops an argument", async () => {
+	const command = "git status --short";
+	const preview = suggestQuickAction(command, "en");
+	completions.shift()?.(JSON.stringify({ title: "Check Git", body: "git status" }));
+	expect(await preview).toEqual({ title: "Check Git", body: command, color: null });
+});
+
+test("uses a palette color only when enabled and keeps the command arguments", async () => {
+	const body = "Run test suite.\n\nnpm test -- --run";
+	const answer = { title: "Run tests", body: "Run tests.\n\nnpm test -- --run", color: "#3a8f68" };
+	const automatic = suggestQuickAction(body, "en", undefined, true);
+	completions.shift()?.(JSON.stringify(answer));
+	expect(await automatic).toEqual({ ...answer, body, color: "#3A8F68" });
+	const manual = suggestQuickAction(body, "en");
+	completions.shift()?.(JSON.stringify(answer));
+	expect(await manual).toEqual({ ...answer, body, color: null });
+});
+
+test("accepts paragraph formatting without letting optimization change execution instructions", async () => {
+	const body = "Prepare the release.\nConfirm with me before publishing.";
+	const generate = async (source: string, proposed: string) => {
+		const result = suggestQuickAction(source, "en");
+		completions.shift()?.(JSON.stringify({ title: "Prepare release", body: proposed }));
+		return (await result)?.body;
+	};
+	expect(await generate(body, "Prepare the release.\n\nConfirm with me before publishing.")).toBe(
+		"Prepare the release.\n\nConfirm with me before publishing.",
+	);
+	expect(await generate(body, "Publish directly.")).toBe(body);
+	expect(await generate("git status --short", "git status --short\ngit push")).toBe("git status --short");
+	expect(await generate("echo done. date", "echo done.\n\ndate")).toBe("echo done. date");
+});
 
 test("reports an invalid model result and clears the failure on retry of the same revision", async () => {
 	const source = { id: "failed-instruction", revision: 1, body: "Rule" };
