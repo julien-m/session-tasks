@@ -14,6 +14,22 @@ CREATE TABLE IF NOT EXISTS permanent_instructions (
   revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
   body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) <= 4096)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS instruction_entry (
+  ordinal INTEGER PRIMARY KEY,
+  id TEXT NOT NULL UNIQUE CHECK(length(id)=36),
+  scope TEXT REFERENCES board(scope),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  body TEXT NOT NULL,
+  removed INTEGER NOT NULL DEFAULT 0 CHECK(removed IN (0,1)),
+  CHECK((removed=1 AND body='') OR (removed=0 AND length(CAST(body AS BLOB)) BETWEEN 1 AND 4096))
+) STRICT;
+CREATE INDEX IF NOT EXISTS instruction_entry_scope ON instruction_entry(scope,ordinal);
+CREATE TABLE IF NOT EXISTS instruction_reformulation (
+  entry_id TEXT NOT NULL PRIMARY KEY REFERENCES instruction_entry(id),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  title TEXT NOT NULL CHECK(length(CAST(title AS BLOB)) BETWEEN 1 AND 240),
+  body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) BETWEEN 1 AND 32768)
+) STRICT;
 CREATE TABLE IF NOT EXISTS board_resume_signal (
   scope TEXT NOT NULL REFERENCES board(scope),
   code_hash TEXT NOT NULL CHECK(length(code_hash)=64 AND code_hash NOT GLOB '*[^0-9a-f]*'),

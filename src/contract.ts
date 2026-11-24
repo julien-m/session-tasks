@@ -48,6 +48,30 @@ export interface BoardInstructions {
 	chat: z.infer<typeof instructionDocument>;
 	permanent: z.infer<typeof instructionDocument>;
 }
+export const instructionEntryId = z.union([id, z.enum(["chat", "permanent"])]);
+export const instructionProjectId = z.uuid();
+export interface InstructionProject {
+	id: string;
+	name: string;
+	chatCount?: number;
+}
+export const instructionEntryWrite = z
+	.object({
+		entryId: instructionEntryId,
+		expectedRevision: instructionDocument.shape.revision,
+		body: boardInstructionsBody.refine((body) => Boolean(body.trim())),
+		permanent: z.boolean(),
+		projectId: instructionProjectId.optional(),
+	})
+	.refine(({ permanent, projectId }) => !permanent || !projectId);
+export type InstructionEntryWrite = z.infer<typeof instructionEntryWrite>;
+export interface InstructionEntry {
+	id: z.infer<typeof instructionEntryId>;
+	revision: number;
+	body: string;
+	permanent: boolean;
+	projectId?: string;
+}
 export const commentBody = textBytes(8192).refine((value) => value.trim().length > 0);
 export const manualCheck = textBytes(1200).refine((value) => value.trim().length > 0);
 export const receipt = textBytes(8192).refine((value) => value.trim().length > 0);
@@ -127,6 +151,11 @@ export const reformulation = z
 	})
 	.strict();
 export type Reformulation = z.infer<typeof reformulation>;
+export interface PresentedInstruction extends InstructionEntry {
+	reformulation?: Reformulation;
+	reformulationPending?: boolean;
+	reformulationFailed?: boolean;
+}
 
 export interface Task extends Revision {
 	id: string;

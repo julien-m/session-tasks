@@ -14,6 +14,8 @@ import {
 	commentBody,
 	id,
 	instructionChanges,
+	instructionEntryId,
+	instructionEntryWrite,
 	manualCheck,
 	receipt,
 	resumeCode,
@@ -25,6 +27,7 @@ import {
 } from "./contract.ts";
 import type { TaskService } from "./task-service.ts";
 import {
+	isInstructionReformulationFailed,
 	isReformulationPending,
 	isTitlePending,
 	scheduleReformulation,
@@ -193,10 +196,10 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 	);
 	agent(
 		"session_tasks_instructions",
-		"Read the user's saved instructions for all chats and this exact chat. The current chat can refine general preferences. Apply both subject to higher-priority instructions and the user's latest explicit request.",
+		"Read the user's saved instructions for all chats, this exact chat and its current Codex project. The current chat can refine general preferences. Apply them subject to higher-priority instructions and the user's latest explicit request.",
 		scoped,
 		true,
-		({ scope }) => result(service.readInstructions(scope), true),
+		({ scope }) => result({ instructions: service.listInstructionEntries(scope) }, true),
 	);
 	agent(
 		"session_tasks_move",
@@ -315,6 +318,44 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		({ scope, changes }) => service.saveInstructions(scope, changes),
 	);
 
+	const manageInstructions = scoped.extend({ manageProjects: z.boolean().optional() });
+	panel("task_panel_instruction_projects", scoped, true, ({ scope }) => ({
+		projects: service.listInstructionProjects(scope),
+	}));
+	panel("task_panel_instruction_entries", manageInstructions, true, ({ scope, manageProjects }) => ({
+		instructions: service.listInstructionEntries(scope, true, manageProjects).map((entry) => ({
+			...entry,
+			reformulationPending: isReformulationPending(entry.id, entry.revision, "instruction"),
+			reformulationFailed: isInstructionReformulationFailed(entry.id, entry.revision),
+		})),
+	}));
+	panel(
+		"task_panel_save_instruction_entry",
+		manageInstructions.extend({ entry: instructionEntryWrite, reformulate: z.enum(["en", "fr"]).optional() }),
+		false,
+		({ scope, entry, reformulate, manageProjects }) => {
+			const saved = service.saveInstructionEntry(scope, entry, Boolean(reformulate), manageProjects);
+			const deferred =
+				reformulate && !saved.reformulation
+					? !scheduleReformulation(
+							saved,
+							reformulate,
+							(generated) => service.saveInstructionReformulation(scope, saved.id, saved.revision, generated),
+							"instruction",
+						)
+					: false;
+			return { saved: true, entryId: saved.id, deferred };
+		},
+	);
+	panel(
+		"task_panel_remove_instruction_entry",
+		manageInstructions.extend({ entryId: instructionEntryId, expectedRevision: serial }),
+		false,
+		({ scope, entryId, expectedRevision, manageProjects }) => {
+			service.removeInstructionEntry(scope, entryId, expectedRevision, manageProjects);
+			return { removed: true };
+		},
+	);
 	panel("task_panel_move", move, false, (command) => {
 		service.moveQueued(command);
 		return { moved: true };

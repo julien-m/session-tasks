@@ -3,10 +3,13 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, test } from "vitest";
+import { localCodexProjects } from "../src/codex-projects.ts";
 import { taskInput } from "../src/contract.ts";
 import { taskHook } from "../src/hook.ts";
 import { openDatabase, TaskRepository } from "../src/repository.ts";
+import { SCHEMA } from "../src/schema.ts";
 import { TaskService } from "../src/task-service.ts";
 
 const resources: Array<() => void> = [];
@@ -454,4 +457,209 @@ test("keeps reformulation through metadata edits, even if generation completes a
 	const after = changeMode(during.revision, "auto");
 	expect(service.readReformulation(after)).toEqual(generated);
 	expect(service.get(scope, task.id).body).toBe(input.body);
+});
+
+test("lists individual instructions including legacy text, and isolates changes to the selected scope", () => {
+	const { service, scope } = harness();
+	const otherThread = randomUUID();
+	const other = service.bind(otherThread);
+	const chatText = "## Existing notes\n\n  Keep formatting.\n";
+	service.saveInstructions(scope, { chat: { revision: 0, body: chatText } });
+	const entryId = randomUUID();
+	const first = { entryId, expectedRevision: 0, body: "**Verify** each change.", permanent: false };
+	service.saveInstructionEntry(scope, first);
+	service.saveInstructionEntry(scope, first);
+	expect(service.listInstructionEntries(scope)).toEqual([
+		{ id: "chat", revision: 1, body: chatText, permanent: false },
+		{ id: entryId, revision: 1, body: first.body, permanent: false },
+	]);
+	expect(service.listInstructionEntries(other)).toEqual([]);
+	expect(() =>
+		service.saveInstructionEntry(other, { ...first, expectedRevision: 1, permanent: true }),
+	).toThrow("conflict");
+	service.saveInstructionEntry(scope, { ...first, expectedRevision: 1, permanent: true });
+	expect(service.listInstructionEntries(other)).toEqual([
+		{ id: entryId, revision: 2, body: first.body, permanent: true },
+	]);
+	const hook = { hook_event_name: "UserPromptSubmit", session_id: otherThread };
+	expect(JSON.stringify(taskHook(service, hook))).toContain("Read session_tasks_instructions");
+	expect(() => service.removeInstructionEntry(other, entryId, 1)).toThrow("conflict");
+	service.removeInstructionEntry(scope, entryId, 2);
+	expect(() => service.saveInstructionEntry(scope, first)).toThrow("conflict");
+	expect(() =>
+		service.saveInstructionEntry(other, { ...first, expectedRevision: 2, permanent: true }),
+	).toThrow("conflict");
+	expect(JSON.stringify(taskHook(service, hook))).toContain("Discard Session Tasks instruction lists");
+	service.saveInstructionEntry(scope, {
+		entryId: "chat",
+		expectedRevision: 1,
+		body: chatText,
+		permanent: true,
+	});
+	expect(service.readInstructions(scope).chat).toEqual({ revision: 2, body: "" });
+	expect(service.listInstructionEntries(other)[0]).toMatchObject({ body: chatText, permanent: true });
+});
+
+test("applies original instructions and only displays the current, scoped reformulation", () => {
+	const { service, scope } = harness();
+	const other = service.bind(randomUUID());
+	const entryId = randomUUID();
+	const original = "Toujours garder les passages en code.\r\nSauf si le fichier est vide.";
+	const first = service.saveInstructionEntry(scope, {
+		entryId,
+		expectedRevision: 0,
+		body: original,
+		permanent: false,
+	});
+	const presented = {
+		title: "Préserver le code",
+		body: "**Préserver** le code, sauf pour les fichiers vides.",
+	};
+	service.saveInstructionReformulation(other, entryId, first.revision, presented);
+	expect(service.listInstructionEntries(scope, true)[0]?.reformulation).toBeUndefined();
+	service.saveInstructionReformulation(scope, entryId, first.revision, presented);
+	expect(service.listInstructionEntries(scope, true)[0]?.reformulation).toEqual(presented);
+	expect(service.listInstructionEntries(scope)[0]).toEqual(first);
+	const moved = service.saveInstructionEntry(scope, {
+		entryId,
+		expectedRevision: 1,
+		body: original,
+		permanent: true,
+	});
+	expect(moved.reformulation).toEqual(presented);
+	expect(service.listInstructionEntries(other, true)[0]?.reformulation).toEqual(presented);
+	const edited = service.saveInstructionEntry(scope, {
+		entryId,
+		expectedRevision: 2,
+		body: "Vérifier la facture.",
+		permanent: true,
+	});
+	expect(service.listInstructionEntries(other, true)[0]?.reformulation).toBeUndefined();
+	service.saveInstructionReformulation(scope, entryId, first.revision, presented);
+	expect(service.listInstructionEntries(scope, true)[0]?.reformulation).toBeUndefined();
+	service.saveInstructionReformulation(scope, entryId, edited.revision, {
+		title: "Facture",
+		body: "- Vérifier la facture.",
+	});
+	expect(service.listInstructionEntries(other, true)[0]?.reformulation?.title).toBe("Facture");
+	service.removeInstructionEntry(scope, entryId, edited.revision);
+	service.saveInstructionReformulation(scope, entryId, edited.revision, presented);
+	expect(service.listInstructionEntries(other, true)).toEqual([]);
+});
+
+test("keeps Markdown wrappers around an instruction at the source byte limit", () => {
+	const { service, scope } = harness();
+	const entryId = randomUUID();
+	const source = "x".repeat(4096);
+	const saved = service.saveInstructionEntry(scope, {
+		entryId,
+		expectedRevision: 0,
+		body: source,
+		permanent: false,
+	});
+	const result = { title: "Exemple complet", body: `\`\`\`text\n${source}\n\`\`\`` };
+	service.saveInstructionReformulation(scope, entryId, saved.revision, result);
+	expect(service.listInstructionEntries(scope, true)[0]?.reformulation).toEqual(result);
+	expect(service.listInstructionEntries(scope)[0]?.body).toBe(source);
+});
+
+test("migrates old instructions and resolves project membership from the local Codex state", () => {
+	const directory = mkdtempSync(join(tmpdir(), "session-tasks-project-"));
+	resources.push(() => rmSync(directory, { recursive: true, force: true }));
+	const statePath = join(directory, "state.sqlite");
+	const state = new DatabaseSync(statePath);
+	resources.push(() => state.close());
+	state.exec(`CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, position INTEGER);
+		CREATE TABLE threads (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id));`);
+	const projectId = randomUUID();
+	const thread = randomUUID();
+	state.prepare("INSERT INTO projects VALUES(?, ?, 0)").run(projectId, "Project");
+	state.prepare("INSERT INTO threads VALUES(?, ?)").run(thread, projectId);
+	const projects = localCodexProjects(statePath);
+	expect(projects.list()).toEqual([{ id: projectId, name: "Project", chatCount: 1 }]);
+	expect(projects.forThread(thread)).toBe(projectId);
+	expect(projects.forThread(randomUUID())).toBeUndefined();
+
+	const taskPath = join(directory, "tasks.sqlite");
+	const legacy = new DatabaseSync(taskPath);
+	legacy.exec(SCHEMA);
+	const scope = randomUUID();
+	const entryId = randomUUID();
+	legacy.prepare("INSERT INTO board VALUES(?, ?)").run(thread, scope);
+	legacy
+		.prepare("INSERT INTO instruction_entry(id,scope,revision,body) VALUES(?, ?, 1, ?)")
+		.run(entryId, scope, "Legacy");
+	legacy.close();
+	const { database } = harness(taskPath);
+	const service = new TaskService(new TaskRepository(database), Date.now, projects);
+	expect(service.listInstructionEntries(scope)).toEqual([
+		{ id: entryId, revision: 1, body: "Legacy", permanent: false },
+	]);
+	expect(() =>
+		database.prepare("UPDATE instruction_entry SET project_id=? WHERE id=?").run(projectId, entryId),
+	).toThrow();
+	expect(database.prepare("PRAGMA index_list(instruction_entry)").all()).toEqual(
+		expect.arrayContaining([expect.objectContaining({ name: "instruction_entry_project" })]),
+	);
+});
+
+test("applies a project instruction only to current members, including after a chat moves", () => {
+	const { database } = harness();
+	const projectId = randomUUID();
+	const secondProject = randomUUID();
+	const editor = randomUUID();
+	const firstChat = randomUUID();
+	const secondChat = randomUUID();
+	const elsewhere = randomUUID();
+	const memberships = new Map<string, string>([
+		[firstChat, projectId],
+		[secondChat, projectId],
+		[elsewhere, secondProject],
+	]);
+	const service = new TaskService(new TaskRepository(database), Date.now, {
+		list: () => [
+			{ id: projectId, name: "First project" },
+			{ id: secondProject, name: "Second project" },
+		],
+		forThread: (thread) => memberships.get(thread),
+	});
+	const owner = service.bind(editor);
+	const first = service.bind(firstChat);
+	const second = service.bind(secondChat);
+	const other = service.bind(elsewhere);
+	const entryId = randomUUID();
+	const body = "Verify the invoices for this project.";
+	const command = { entryId, body, expectedRevision: 0, permanent: false, projectId };
+	expect(() =>
+		service.saveInstructionEntry(owner, { ...command, projectId: randomUUID() }, true, true),
+	).toThrow("invalid_context");
+	expect(() => service.saveInstructionEntry(owner, { ...command, permanent: true }, true, true)).toThrow(
+		"invalid_context",
+	);
+	service.saveInstructionEntry(owner, command, true, true);
+	service.saveInstructionReformulation(owner, entryId, 1, { title: "Verify invoices", body: "Formatted" });
+	expect(service.listInstructionEntries(owner, true, true)[0]?.reformulation?.title).toBe("Verify invoices");
+	expect(service.listInstructionEntries(first)).toEqual([
+		{ id: entryId, body, revision: 1, permanent: false, projectId },
+	]);
+	expect(service.listInstructionEntries(second)[0]?.body).toBe(body);
+	expect(service.listInstructionEntries(owner)).toEqual([]);
+	expect(service.listInstructionEntries(other)).toEqual([]);
+	const hook = (session_id: string) =>
+		JSON.stringify(taskHook(service, { hook_event_name: "UserPromptSubmit", session_id }));
+	expect(hook(firstChat)).toContain("Read session_tasks_instructions");
+	expect(hook(elsewhere)).not.toContain("Read session_tasks_instructions");
+	memberships.set(firstChat, secondProject);
+	expect(service.listInstructionEntries(first)).toEqual([]);
+	expect(hook(firstChat)).not.toContain("Read session_tasks_instructions");
+	service.saveInstructionEntry(
+		owner,
+		{ ...command, expectedRevision: 1, projectId: secondProject },
+		true,
+		true,
+	);
+	expect(service.listInstructionEntries(second)).toEqual([]);
+	expect(service.listInstructionEntries(other)[0]?.body).toBe(body);
+	service.removeInstructionEntry(owner, entryId, 2, true);
+	expect(service.listInstructionEntries(other)).toEqual([]);
 });

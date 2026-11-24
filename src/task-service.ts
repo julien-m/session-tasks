@@ -1,5 +1,7 @@
 /** Task commands and revision-aware work ownership. */
+
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import type { CodexProjects } from "./codex-projects.ts";
 import {
 	type Actor,
 	appendContextText,
@@ -7,10 +9,13 @@ import {
 	type BoardInstructions,
 	commentBody,
 	type InstructionChanges,
+	type InstructionEntryWrite,
 	instructionChanges,
+	instructionEntryWrite,
 	MAX_FILE_BYTES,
 	MAX_UPLOAD_BYTES,
 	manualCheck,
+	type PresentedInstruction,
 	type Reformulation,
 	type Revision,
 	reformulation,
@@ -81,6 +86,7 @@ export class TaskService {
 	constructor(
 		private readonly store: TaskRepository,
 		private readonly now: () => number = Date.now,
+		private readonly projects?: CodexProjects,
 	) {}
 
 	/** Returns the task board capability issued to a trusted lifecycle hook. */
@@ -108,6 +114,52 @@ export class TaskService {
 		const checked = instructionChanges.safeParse(changes);
 		if (!checked.success) throw new TaskError("invalid_context");
 		return this.store.saveInstructions(scope, checked.data);
+	}
+
+	listInstructionProjects(scope: string) {
+		this.store.assertScope(scope);
+		return this.projects?.list() ?? [];
+	}
+
+	listInstructionEntries(scope: string, presented = false, manageProjects = false): PresentedInstruction[] {
+		const projectId = presented ? undefined : this.projects?.forThread(this.store.threadForScope(scope));
+		return this.store.listInstructionEntries(scope, presented, projectId, manageProjects);
+	}
+
+	saveInstructionEntry(
+		scope: string,
+		input: InstructionEntryWrite,
+		materializeLegacy = false,
+		manageProjects = false,
+	): PresentedInstruction {
+		const checked = instructionEntryWrite.safeParse(input);
+		if (!checked.success) throw new TaskError("invalid_context");
+		if (
+			checked.data.projectId &&
+			(!manageProjects ||
+				!this.listInstructionProjects(scope).some((project) => project.id === checked.data.projectId))
+		)
+			throw new TaskError("invalid_context");
+		return this.store.saveInstructionEntry(scope, checked.data, materializeLegacy, manageProjects);
+	}
+
+	saveInstructionReformulation(
+		scope: string,
+		entryId: string,
+		revision: number,
+		result: Reformulation,
+	): void {
+		const checked = reformulation.safeParse(result);
+		if (checked.success) this.store.saveInstructionReformulation(scope, entryId, revision, checked.data);
+	}
+
+	removeInstructionEntry(
+		scope: string,
+		entryId: string,
+		expectedRevision: number,
+		manageProjects = false,
+	): void {
+		this.store.removeInstructionEntry(scope, entryId, expectedRevision, manageProjects);
 	}
 
 	moveQueued(command: {

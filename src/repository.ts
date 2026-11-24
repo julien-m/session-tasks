@@ -10,9 +10,12 @@ import {
 	type BoardFilter,
 	type BoardInstructions,
 	type InstructionChanges,
+	type InstructionEntry,
+	type InstructionEntryWrite,
 	MAX_PAGE,
 	type Mode,
 	manualCheck,
+	type PresentedInstruction,
 	type Reformulation,
 	type Revision,
 	type State,
@@ -115,6 +118,27 @@ export function openDatabase(path: string): DatabaseSync {
 	const database = new DatabaseSync(path, { enableForeignKeyConstraints: true });
 	database.exec("PRAGMA busy_timeout=2500; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
 	database.exec(SCHEMA);
+	const hasProjectColumn = () =>
+		database
+			.prepare("PRAGMA table_info(instruction_entry)")
+			.all()
+			.some((column) => column.name === "project_id");
+	if (!hasProjectColumn()) {
+		database.exec("BEGIN IMMEDIATE");
+		try {
+			if (!hasProjectColumn())
+				database.exec(`ALTER TABLE instruction_entry ADD COLUMN project_id TEXT
+					CHECK(project_id IS NULL OR (scope IS NULL AND length(project_id)=36))`);
+			database.exec(
+				"CREATE INDEX IF NOT EXISTS instruction_entry_project ON instruction_entry(project_id,ordinal) WHERE project_id IS NOT NULL",
+			);
+			database.exec("COMMIT");
+		} catch (error) {
+			database.exec("ROLLBACK");
+			database.close();
+			throw error;
+		}
+	}
 	return database;
 }
 
@@ -174,6 +198,25 @@ export class TaskRepository {
 		};
 	}
 
+	private writeInstructionDocument(
+		scope: string,
+		mode: keyof BoardInstructions,
+		revision: number,
+		body: string,
+	): void {
+		if (mode === "chat") {
+			this.database
+				.prepare(`INSERT INTO board_instructions(scope,revision,body) VALUES (?,?,?)
+				ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,body=excluded.body`)
+				.run(scope, revision, body);
+		} else {
+			this.database
+				.prepare(`INSERT INTO permanent_instructions(singleton,revision,body) VALUES (1,?,?)
+				ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,body=excluded.body`)
+				.run(revision, body);
+		}
+	}
+
 	saveInstructions(scope: string, changes: InstructionChanges): BoardInstructions {
 		return this.write(() => {
 			const current = this.readInstructions(scope);
@@ -184,20 +227,168 @@ export class TaskRepository {
 				const body = change.body.trim() ? change.body : "";
 				if (body === current[mode].body) continue;
 				const revision = change.revision + 1;
-				if (mode === "chat") {
-					this.database
-						.prepare(`INSERT INTO board_instructions(scope,revision,body) VALUES (?,?,?)
-						ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,body=excluded.body`)
-						.run(scope, revision, body);
-				} else {
-					this.database
-						.prepare(`INSERT INTO permanent_instructions(singleton,revision,body) VALUES (1,?,?)
-						ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,body=excluded.body`)
-						.run(revision, body);
-				}
+				this.writeInstructionDocument(scope, mode, revision, body);
 				current[mode] = { revision, body };
 			}
+			this.checkInstructionCapacity(scope);
 			return current;
+		});
+	}
+
+	/** Old documents remain editable from previously opened panels and appear as single entries. */
+	listInstructionEntries(
+		scope: string,
+		presented = false,
+		projectId?: string,
+		manageProjects = false,
+	): PresentedInstruction[] {
+		this.assertScope(scope);
+		const formatColumns = presented ? "f.title,f.body formattedBody" : "NULL title,NULL formattedBody";
+		const formatJoin = presented
+			? "LEFT JOIN instruction_reformulation f ON f.entry_id=e.id AND f.revision=e.revision"
+			: "";
+		const rows = this.database
+			.prepare(`SELECT id,revision,body,permanent,projectId,title,formattedBody FROM (
+				SELECT 'chat' id,revision,body,0 permanent,NULL projectId,-2 ordinal,NULL title,NULL formattedBody
+				FROM board_instructions WHERE scope=? AND body!=''
+				UNION ALL
+				SELECT 'permanent',revision,body,1,NULL,-1,NULL,NULL FROM permanent_instructions WHERE singleton=1 AND body!=''
+				UNION ALL
+				SELECT e.id,e.revision,e.body,(e.scope IS NULL AND e.project_id IS NULL),e.project_id,e.ordinal,${formatColumns}
+				FROM instruction_entry e ${formatJoin} WHERE e.removed=0 AND ((e.project_id IS NULL AND (e.scope IS NULL OR e.scope=?)) OR e.project_id=? OR (?=1 AND e.project_id IS NOT NULL))
+			) ORDER BY ordinal`)
+			.all(scope, scope, projectId ?? null, Number(manageProjects)) as unknown as Array<
+			Omit<InstructionEntry, "permanent" | "projectId"> & {
+				permanent: 0 | 1;
+				projectId: string | null;
+				title: string | null;
+				formattedBody: string | null;
+			}
+		>;
+		return rows.map(({ permanent, projectId, title, formattedBody, ...entry }) => ({
+			...entry,
+			permanent: Boolean(permanent),
+			...(projectId ? { projectId } : {}),
+			...(title && formattedBody ? { reformulation: { title, body: formattedBody } } : {}),
+		}));
+	}
+
+	private checkInstructionCapacity(scope: string, projectId?: string): void {
+		const entries = this.listInstructionEntries(scope, false, projectId);
+		for (const target of [false, true, projectId]) {
+			if (target === undefined) continue;
+			const list = entries.filter((entry) => (entry.projectId ?? entry.permanent) === target);
+			const bytes = list.reduce((total, entry) => total + Buffer.byteLength(entry.body) + 2, 0);
+			if (list.length > 50 || bytes > 16384) throw new TaskError("invalid_context");
+		}
+	}
+
+	saveInstructionEntry(
+		scope: string,
+		input: InstructionEntryWrite,
+		materializeLegacy = false,
+		manageProjects = false,
+	): PresentedInstruction {
+		return this.write(() => {
+			const { entryId, expectedRevision, body, permanent, projectId } = input;
+			const current = this.listInstructionEntries(scope, true, undefined, manageProjects).find(
+				(entry) => entry.id === entryId,
+			);
+			const owner = permanent || projectId ? null : scope;
+			const project = projectId ? { projectId } : {};
+			const same =
+				current?.body === body && current.permanent === permanent && current.projectId === projectId;
+			if (expectedRevision === 0 && current && same) return current;
+			if ((current?.revision ?? 0) !== expectedRevision) throw new TaskError("conflict");
+			let saved: PresentedInstruction;
+			if (entryId === "chat" || entryId === "permanent") {
+				if (!current) throw new TaskError("conflict");
+				if (!materializeLegacy && !projectId && current.permanent === permanent) {
+					this.writeInstructionDocument(scope, entryId, current.revision + 1, body);
+					saved = { id: entryId, revision: current.revision + 1, permanent, body };
+				} else {
+					this.writeInstructionDocument(scope, entryId, current.revision + 1, "");
+					const id = randomUUID();
+					this.insertInstructionEntry(id, owner, body, projectId);
+					saved = { id, revision: 1, permanent, body, ...project };
+				}
+			} else if (current) {
+				if (same) return current;
+				const revision = current.revision + 1;
+				this.database
+					.prepare(`UPDATE instruction_entry SET scope=?,project_id=?,revision=?,body=? WHERE id=?`)
+					.run(owner, projectId ?? null, revision, body, entryId);
+				const reformulation = current.body === body ? current.reformulation : undefined;
+				if (reformulation)
+					this.database
+						.prepare("UPDATE instruction_reformulation SET revision=? WHERE entry_id=?")
+						.run(revision, entryId);
+				saved = {
+					id: entryId,
+					revision,
+					permanent,
+					body,
+					...project,
+					...(reformulation ? { reformulation } : {}),
+				};
+			} else {
+				this.insertInstructionEntry(entryId, owner, body, projectId);
+				saved = { id: entryId, revision: 1, permanent, body, ...project };
+			}
+			this.checkInstructionCapacity(scope, projectId);
+			return saved;
+		});
+	}
+
+	saveInstructionReformulation(
+		scope: string,
+		entryId: string,
+		revision: number,
+		generated: Reformulation,
+	): void {
+		this.database
+			.prepare(`INSERT INTO instruction_reformulation(entry_id,revision,title,body)
+			SELECT id,revision,?,? FROM instruction_entry
+			WHERE id=? AND revision=? AND removed=0 AND (scope IS NULL OR scope=?)
+			ON CONFLICT(entry_id) DO UPDATE SET revision=excluded.revision,title=excluded.title,body=excluded.body
+			WHERE instruction_reformulation.revision < excluded.revision`)
+			.run(generated.title, generated.body, entryId, revision, scope);
+	}
+
+	private insertInstructionEntry(
+		entryId: string,
+		scope: string | null,
+		body: string,
+		projectId?: string,
+	): void {
+		const result = this.database
+			.prepare(`INSERT INTO instruction_entry(id,scope,project_id,revision,body) VALUES (?,?,?,1,?)
+			ON CONFLICT(id) DO NOTHING`)
+			.run(entryId, scope, projectId ?? null, body);
+		if (result.changes !== 1) throw new TaskError("conflict");
+	}
+
+	removeInstructionEntry(
+		scope: string,
+		entryId: string,
+		expectedRevision: number,
+		manageProjects = false,
+	): void {
+		this.write(() => {
+			const current = this.listInstructionEntries(scope, false, undefined, manageProjects).find(
+				(entry) => entry.id === entryId,
+			);
+			if (current?.revision !== expectedRevision) throw new TaskError("conflict");
+			if (entryId === "chat" || entryId === "permanent") {
+				this.writeInstructionDocument(scope, entryId, current.revision + 1, "");
+			} else {
+				this.database
+					.prepare(
+						"UPDATE instruction_entry SET removed=1, body='', revision=revision+1 WHERE id=? AND (scope IS NULL OR scope=?)",
+					)
+					.run(entryId, scope);
+				this.database.prepare("DELETE FROM instruction_reformulation WHERE entry_id=?").run(entryId);
+			}
 		});
 	}
 

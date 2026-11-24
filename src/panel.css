@@ -74,8 +74,24 @@ main {
 	align-items: center;
 	flex-wrap: wrap;
 }
-.board-header > .group {
-	justify-content: space-between;
+.board-tab-panel:not([hidden]) {
+	display: flex;
+	flex: 1;
+	flex-direction: column;
+	min-block-size: 0;
+	min-inline-size: 0;
+	gap: var(--space-sm);
+}
+.board-tabs {
+	flex-wrap: nowrap;
+	gap: var(--space-md);
+	overflow-x: auto;
+	border-block-end: 1px solid var(--border);
+}
+.instruction-icon {
+	align-self: center;
+	justify-self: center;
+	color: var(--color-text-secondary, GrayText);
 }
 .field {
 	flex-direction: column;
@@ -262,8 +278,19 @@ img {
 	}
 }
 
-.board-header h1 {
-	font-size: 0.95rem;
+.board-tabs button {
+	flex: none;
+	border: 0;
+	border-radius: 0;
+	border-block-end: 2px solid transparent;
+	background: transparent;
+	font-size: 0.929rem;
+	font-weight: 600;
+	min-block-size: 28px;
+}
+.board-tabs button[aria-selected="true"] {
+	border-block-end-color: var(--accent);
+	background: var(--shade);
 }
 .progress:not([hidden]),
 .board-add {
@@ -424,35 +451,9 @@ img {
 	border: 1px solid var(--border);
 	padding: var(--space-xs);
 }
-.markdown-editor {
-	display: flex;
-	flex-direction: column;
-	gap: var(--space-xs);
-	min-inline-size: 0;
-}
-.markdown-toolbar {
-	justify-content: space-between;
-	gap: var(--space-xs);
-	font-size: 0.857rem;
-}
-.revision-format {
-	align-self: flex-end;
-	font-size: 0.8rem;
-}
-.markdown-controls {
-	gap: var(--space-xs);
-}
-.markdown-controls button {
-	font-size: 0.8rem;
-}
-.markdown-controls button[aria-pressed="true"] {
-	background: var(--shade);
-	border-color: var(--accent);
-}
-.markdown-preview {
-	border: 1px dashed var(--border);
-	border-radius: var(--space-xs);
-	padding: var(--space-sm);
+.revision-original summary {
+	cursor: pointer;
+	font-size: 0.875rem;
 }
 .task-discussion textarea {
 	min-block-size: 56px;
@@ -581,6 +582,11 @@ img {
 	border: 1px solid currentColor;
 	color: var(--task-amber);
 	font-size: 9px;
+}
+.instruction-row .task-title {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 .task-marker[data-state="done"] + .task-copy .task-title {
 	font-weight: 450;
@@ -731,6 +737,30 @@ dialog[data-layout="pane"] {
 	border-radius: 0;
 }
 
+dialog[data-layout="instruction"] .dialog-content {
+	gap: var(--space-md);
+}
+dialog[data-layout="instruction"] form {
+	gap: var(--space-base);
+}
+dialog[open][data-layout="pane"]:has(.detail-footer:not([hidden])) {
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-sm);
+	overflow: hidden;
+}
+dialog[open][data-layout="pane"]:has(.detail-footer:not([hidden])) > .dialog-content {
+	flex: 1;
+	min-block-size: 0;
+	overflow: auto;
+}
+.detail-footer {
+	flex: none;
+	justify-content: space-between;
+	border-block-start: 1px solid var(--border);
+	padding-block-start: var(--space-sm);
+}
+
 .reorder-handle {
 	cursor: grab;
 	touch-action: none;
@@ -743,4 +773,275 @@ dialog[data-layout="pane"] {
 }
 .reorder-target {
 	outline: 1px solid var(--accent);
+}
+
+dialog[data-layout="instruction"] {
+	--instruction-surface: light-dark(#fff, #121211);
+	--instruction-control: light-dark(#f5f5f4, #171716);
+	--instruction-line: light-dark(#d6d6d4, #303030);
+	--instruction-quiet-line: light-dark(#e3e3e0, #202020);
+	--instruction-text: light-dark(#222220, #d8d8d5);
+	--instruction-muted: light-dark(#565654, #a0a09d);
+	--instruction-blue: light-dark(#315c9b, #556a98);
+	--instruction-focus: light-dark(#315c9b, #8ca8e0);
+	--instruction-selected: light-dark(#e8eff9, #151d2c);
+	--accent: var(--instruction-focus);
+	inset-block: var(--space-md) auto;
+	inset-inline: auto var(--space-base);
+	inline-size: min(calc(100% - 2 * var(--space-base)), 526px);
+	margin: 0;
+	padding: 14px;
+	border: 1px solid var(--instruction-line);
+	border-radius: var(--space-md);
+	background: var(--instruction-surface);
+	color: var(--instruction-text);
+	box-shadow: 0 var(--space-sm) var(--space-base) rgb(0 0 0 / 0.18);
+	font-size: 13px;
+	line-height: 19px;
+}
+dialog[data-layout="instruction"]::backdrop {
+	background: light-dark(rgb(235 235 235 / 0.9), rgb(14 14 14 / 0.96));
+}
+dialog[data-layout="instruction"] .task-detail-header {
+	gap: var(--space-xs);
+}
+dialog[data-layout="instruction"] .back {
+	min-block-size: 16px;
+	padding-block: 0;
+	font-size: 12px;
+	line-height: 16px;
+	color: var(--instruction-muted);
+}
+dialog[data-layout="instruction"] h2 {
+	margin: 0;
+	font-size: 15px;
+	line-height: 20px;
+	font-weight: 650;
+}
+.instruction-text-field,
+.instruction-scope {
+	display: grid;
+	gap: var(--space-xs);
+	min-inline-size: 0;
+}
+.instruction-text-field .field {
+	gap: var(--space-xs);
+	font-size: 12px;
+	line-height: 16px;
+	font-weight: 600;
+}
+.instruction-text-field :where(textarea) {
+	min-block-size: 116px;
+	padding: var(--space-sm) var(--space-md);
+	border-color: var(--instruction-line);
+	border-radius: var(--space-sm);
+	background: var(--instruction-control);
+	font: 400 13px / 19px var(--font-sans, system-ui, sans-serif);
+}
+.instruction-text-field :where(textarea:focus) {
+	outline: 1px solid var(--instruction-focus);
+	outline-offset: -1px;
+	border-color: var(--instruction-focus);
+}
+.instruction-hint,
+.instruction-project-empty {
+	margin: 0;
+	color: var(--instruction-muted);
+	font-size: 11px;
+	line-height: 16px;
+	font-weight: 400;
+}
+.instruction-audience,
+.instruction-project {
+	display: grid;
+	gap: var(--space-xs);
+	min-inline-size: 0;
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+.instruction-audience legend,
+.instruction-project legend {
+	padding: 0 0 var(--space-xs);
+	font-size: 12px;
+	line-height: 16px;
+	font-weight: 600;
+}
+.instruction-segments {
+	display: grid;
+	gap: 2px;
+	padding: 2px;
+	border: 1px solid var(--instruction-quiet-line);
+	border-radius: var(--space-sm);
+	background: var(--instruction-control);
+}
+.instruction-segments label,
+.instruction-project-row {
+	display: flex;
+	align-items: center;
+	gap: var(--space-sm);
+	min-inline-size: 0;
+	min-block-size: 32px;
+	padding: var(--space-xs) var(--space-sm);
+	border-radius: 6px;
+	cursor: pointer;
+	overflow-wrap: anywhere;
+}
+.instruction-segments label {
+	color: var(--instruction-muted);
+	font-size: 12px;
+	line-height: 16px;
+}
+.instruction-segments label:has(:checked) {
+	background: var(--instruction-surface);
+	color: var(--instruction-text);
+	font-weight: 650;
+}
+.instruction-segments input {
+	flex: none;
+	inline-size: 14px;
+	block-size: 14px;
+	margin: 0;
+	padding: 0;
+	accent-color: var(--instruction-focus);
+}
+.instruction-project-rows {
+	display: grid;
+	gap: 2px;
+	max-block-size: 130px;
+	overflow: auto;
+	overscroll-behavior: contain;
+	padding: var(--space-xs);
+	border: 1px solid var(--instruction-quiet-line);
+	border-radius: var(--space-sm);
+}
+.instruction-project-row {
+	position: relative;
+	min-block-size: 29px;
+	font-size: 12px;
+	line-height: 16px;
+}
+.instruction-project-row input {
+	position: absolute;
+	opacity: 0;
+	inline-size: 1px;
+	block-size: 1px;
+	margin: 0;
+	padding: 0;
+}
+.instruction-project-row:has(:checked) {
+	background: var(--instruction-selected);
+	font-weight: 650;
+}
+.instruction-project-row:has(:focus-visible) {
+	outline: 2px solid var(--instruction-focus);
+	outline-offset: -2px;
+}
+.instruction-project-row:hover {
+	background: var(--instruction-control);
+}
+.instruction-project-row:has(:checked):hover {
+	background: var(--instruction-selected);
+}
+.instruction-project-check {
+	flex: 0 0 14px;
+	visibility: hidden;
+	color: var(--instruction-focus);
+}
+.instruction-project-row:has(:checked) .instruction-project-check {
+	visibility: visible;
+}
+.instruction-project-name {
+	flex: 1;
+	min-inline-size: 0;
+}
+.instruction-project-count {
+	color: var(--instruction-muted);
+	font-size: 11px;
+	font-weight: 400;
+}
+.instruction-project[hidden],
+.instruction-project-empty[hidden] {
+	display: none;
+}
+.instruction-hint + .instruction-project,
+.instruction-hint + .instruction-project[hidden] + .instruction-project-empty:not([hidden]) {
+	margin-block-start: var(--space-xs);
+}
+.instruction-project-empty {
+	padding: var(--space-sm);
+	border: 1px dashed var(--instruction-line);
+	border-radius: var(--space-sm);
+}
+.instruction-reading {
+	display: grid;
+	gap: var(--space-sm);
+}
+.instruction-reading h3 {
+	margin: 0;
+	font-size: 12px;
+}
+.instruction-footer {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: space-between;
+	gap: var(--space-sm);
+}
+.instruction-actions {
+	flex: 1;
+	justify-content: flex-end;
+}
+.instruction-footer button,
+.instruction-reading ~ .group button {
+	min-block-size: 30px;
+	padding-inline: 10px;
+	border-color: var(--instruction-line);
+	border-radius: var(--space-sm);
+	background: var(--instruction-surface);
+	font-size: 11px;
+	font-weight: 600;
+}
+.instruction-footer button:hover:not(:disabled),
+.instruction-reading ~ .group button:hover:not(:disabled) {
+	background: var(--instruction-control);
+}
+.instruction-footer .primary,
+.instruction-footer .primary:hover:not(:disabled) {
+	border-color: var(--instruction-blue);
+	background: var(--instruction-blue);
+	color: #fff;
+}
+@media (width < 400px) {
+	dialog[data-layout="instruction"] {
+		inset: 0;
+		inline-size: 100%;
+		max-inline-size: 100%;
+		block-size: 100%;
+		padding: var(--space-base);
+		max-block-size: 100%;
+		border: 0;
+		border-radius: 0;
+		box-shadow: none;
+	}
+	.instruction-actions {
+		flex-basis: 100%;
+	}
+	.instruction-actions button {
+		flex: 1;
+	}
+}
+@media (width >= 480px) {
+	.instruction-segments {
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+	}
+	.instruction-segments label {
+		justify-content: center;
+		min-block-size: 25px;
+	}
+	.instruction-text-field :where(textarea) {
+		min-block-size: 136px;
+	}
+}
+.detail-footer[hidden] {
+	display: none;
 }

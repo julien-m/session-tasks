@@ -1,10 +1,12 @@
 /** Starts the loopback MCP endpoint owned by Localhost Supervisor. */
+
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import manifest from "../plugin.json" with { type: "json" };
+import { localCodexProjects } from "./codex-projects.ts";
 import { MAX_UPLOAD_BYTES } from "./contract.ts";
 import { createTaskMcp } from "./mcp-tools.ts";
 import { openDatabase, TaskRepository } from "./repository.ts";
@@ -19,7 +21,7 @@ const port = z.coerce
 	.parse(process.argv[2] ?? DEFAULT_PORT);
 const authority = `${HOST}:${port}`;
 const database = openDatabase(databasePath());
-const service = new TaskService(new TaskRepository(database));
+const service = new TaskService(new TaskRepository(database), Date.now, localCodexProjects());
 const html = readFileSync(new URL("./tasks.html", import.meta.url), "utf8");
 const handler = createMcpHandler(() => createTaskMcp(service, html, manifest.version), {
 	maxRequestBodySize: Math.ceil((MAX_UPLOAD_BYTES * 4) / 3) + 131072,

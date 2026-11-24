@@ -19,16 +19,18 @@ import {
 	type Attachment,
 	appendContextText,
 	type BoardFilter,
-	type BoardInstructions,
+	boardInstructionsBody,
 	byteLength,
 	commentBody,
-	type InstructionChanges,
+	type InstructionEntryWrite,
+	type InstructionProject,
 	id,
-	instructionChanges,
+	instructionEntryWrite,
 	MAX_BOARD_INSTRUCTIONS_BYTES,
 	MAX_PAGE,
 	MAX_TASK_BODY_BYTES,
 	manualCheck,
+	type PresentedInstruction,
 	type Reformulation,
 	type Revision,
 	resumeCodePrefix,
@@ -95,44 +97,6 @@ function markdownBlock(source: string, className = "markdown-content"): HTMLDivE
 	return content;
 }
 
-function markdownEditor(caption: string, textarea: HTMLTextAreaElement, initialPreview = false) {
-	const wrapper = element("div", undefined, "markdown-editor");
-	const preview = element("div", undefined, "markdown-content markdown-preview");
-	preview.setAttribute("role", "region");
-	preview.setAttribute("aria-label", t.markdownPreview);
-	const source = button(t.markdownText, () => setPreview(false));
-	const rendered = button(t.markdownPreview, () => setPreview(true));
-	const controls = group(source, rendered);
-	controls.classList.add("markdown-controls");
-	controls.setAttribute("role", "group");
-	controls.setAttribute("aria-label", caption);
-	const label = element("label", caption);
-	textarea.id = `markdown-source-${newTaskId()}`;
-	label.htmlFor = textarea.id;
-	const toolbar = group(label, controls);
-	toolbar.classList.add("markdown-toolbar");
-	wrapper.append(toolbar, textarea, preview);
-
-	const refresh = () => {
-		if (!preview.hidden) {
-			updateMarkdown(preview, textarea.value);
-			if (!preview.hasChildNodes()) preview.textContent = t.markdownEmpty;
-		}
-	};
-
-	function setPreview(enabled: boolean): void {
-		source.setAttribute("aria-pressed", String(!enabled));
-		rendered.setAttribute("aria-pressed", String(enabled));
-		textarea.hidden = enabled;
-		preview.hidden = !enabled;
-		refresh();
-	}
-
-	textarea.addEventListener("invalid", () => setPreview(false));
-	setPreview(initialPreview);
-	return { wrapper, refresh, setPreview, isPreview: () => !preview.hidden };
-}
-
 let scope: string | undefined;
 async function call<T>(name: string, args: Record<string, unknown> = {}): Promise<T> {
 	if (!scope) throw new Error("invalid_scope");
@@ -174,9 +138,45 @@ transferNotice.setAttribute("role", "status");
 const dropZone = element("p", t.dropHere, "drop-zone");
 main.tabIndex = 0;
 const dialog = element("dialog");
+let returnToPreviousView: (() => void) | undefined;
+function goBackInPanel(): void {
+	if (mutation) return;
+	if (returnToPreviousView) returnToPreviousView();
+	else dialog.close();
+}
+
 dialog.addEventListener("cancel", (event) => {
-	if (mutation) event.preventDefault();
+	event.preventDefault();
+	goBackInPanel();
 });
+window.addEventListener(
+	"keydown",
+	(event) => {
+		if (!dialog.open || event.defaultPrevented || event.isComposing || event.repeat) return;
+		const editable =
+			event.target instanceof HTMLElement &&
+			(event.target.matches("input, textarea, select") || event.target.isContentEditable);
+		const back =
+			event.key === "BrowserBack" ||
+			(event.metaKey && !event.altKey && event.key === "[") ||
+			(event.altKey && !event.metaKey && !editable && event.key === "ArrowLeft");
+		if (!back || event.shiftKey || event.ctrlKey) return;
+		event.preventDefault();
+		event.stopImmediatePropagation();
+		goBackInPanel();
+	},
+	{ capture: true },
+);
+window.addEventListener(
+	"auxclick",
+	(event) => {
+		if (!dialog.open || event.button !== 3) return;
+		event.preventDefault();
+		event.stopImmediatePropagation();
+		goBackInPanel();
+	},
+	{ capture: true },
+);
 dialog.addEventListener("keydown", (event) => {
 	if (
 		event.defaultPrevented ||
@@ -194,7 +194,9 @@ dialog.addEventListener("keydown", (event) => {
 });
 dialog.setAttribute("aria-labelledby", "task-dialog-title");
 const dialogContent = element("div", undefined, "dialog-content");
-dialog.append(dialogContent);
+const detailFooter = element("footer", undefined, "group detail-footer comment-actions");
+detailFooter.hidden = true;
+dialog.append(dialogContent, detailFooter);
 const add = button("+", () => showEditor(), "icon-button");
 add.setAttribute("aria-label", t.add);
 add.title = t.add;
@@ -289,9 +291,26 @@ const pageNavigation = group(previous, more);
 const filterBar = group(filters, cancelledFilter, resume);
 filterBar.classList.add("board-filters");
 const boardHeader = element("header", undefined, "board-header");
-const instructionsButton = button(t.instructions, () => void showInstructions());
-instructionsButton.disabled = true;
-boardHeader.append(group(element("h1", t.heading), instructionsButton));
+const taskTab = button(t.heading, () => selectBoardTab(false));
+const instructionTab = button(t.instructions, () => selectBoardTab(true));
+const tabList = group(taskTab, instructionTab);
+tabList.classList.add("board-tabs");
+tabList.setAttribute("role", "tablist");
+tabList.setAttribute("aria-label", t.boardViews);
+for (const [index, tab] of [taskTab, instructionTab].entries()) {
+	tab.id = index ? "tab-instructions" : "tab-tasks";
+	tab.setAttribute("role", "tab");
+	tab.setAttribute("aria-selected", String(index === 0));
+	tab.tabIndex = index === 0 ? 0 : -1;
+	tab.onkeydown = (event) => {
+		if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+		event.preventDefault();
+		const selectInstructions = event.key === "End" || (event.key !== "Home" && index === 0);
+		selectBoardTab(selectInstructions);
+		(selectInstructions ? instructionTab : taskTab).focus();
+	};
+}
+boardHeader.append(tabList);
 const boardList = element("div", undefined, "board-list");
 boardList.append(transferNotice, notice, rows, dropZone);
 const addRow = element("div", undefined, "board-add");
@@ -304,7 +323,77 @@ boardFooter.append(
 	progressGroup,
 	addRow,
 );
-main.append(boardHeader, boardList, boardFooter);
+const taskPanel = element("section", undefined, "board-tab-panel");
+const instructionPanel = element("section", undefined, "board-tab-panel");
+for (const [panel, tab] of [
+	[taskPanel, taskTab],
+	[instructionPanel, instructionTab],
+] as const) {
+	panel.setAttribute("role", "tabpanel");
+	panel.setAttribute("aria-labelledby", tab.id);
+}
+const instructionList = element("ul", undefined, "rows");
+const instructionNotice = element("p", t.loading, "notice");
+instructionNotice.setAttribute("role", "status");
+const instructionScroll = element("div", undefined, "board-list");
+instructionScroll.append(instructionNotice, instructionList);
+const instructionAdd = button(
+	"+",
+	() => showInstructionEditor(undefined, { text: quickInstruction.value, files: [] }),
+	"icon-button",
+);
+instructionAdd.disabled = true;
+instructionAdd.setAttribute("aria-label", t.addInstruction);
+instructionAdd.title = t.addInstruction;
+const instructionQuickForm = element("form", undefined, "quick-add");
+const quickInstruction = element("input");
+quickInstruction.setAttribute("aria-label", t.quickInstruction);
+quickInstruction.placeholder = t.quickInstruction;
+quickInstruction.required = true;
+const quickInstructionSubmit = element("button", "↵", "icon-button");
+quickInstructionSubmit.type = "submit";
+quickInstructionSubmit.setAttribute("aria-label", t.quickInstruction);
+instructionQuickForm.append(quickInstruction, quickInstructionSubmit);
+let unsavedInstruction: { scope: string; draft: string; entryId: string } | undefined;
+instructionQuickForm.onsubmit = async (event) => {
+	event.preventDefault();
+	const draft = quickInstruction.value;
+	if (!scope || mutation || !draft.trim()) return;
+	if (unsavedInstruction?.scope !== scope || unsavedInstruction.draft !== draft)
+		unsavedInstruction = { scope, draft, entryId: newTaskId() };
+	const command = instructionEntryWrite.safeParse({
+		entryId: unsavedInstruction.entryId,
+		expectedRevision: 0,
+		body: draft,
+		permanent: false,
+	});
+	if (!command.success) {
+		instructionNotice.textContent = t.instructionsLimit;
+		return;
+	}
+	const board = scope;
+	mutation = true;
+	quickInstructionSubmit.disabled = true;
+	try {
+		await saveInstruction(command.data);
+		unsavedInstruction = undefined;
+		if (scope === board && quickInstruction.value === draft) quickInstruction.value = "";
+		void refreshInstructions();
+	} catch {
+		if (scope === board) instructionNotice.textContent = t.error;
+	} finally {
+		quickInstructionSubmit.disabled = false;
+		finishMutation();
+	}
+};
+const instructionFooter = element("footer", undefined, "board-footer");
+const instructionAddRow = element("div", undefined, "board-add");
+instructionAddRow.append(instructionQuickForm, instructionAdd);
+instructionFooter.append(element("small", `v${manifest.version}`, "meta"), instructionAddRow);
+taskPanel.append(boardList, boardFooter);
+instructionPanel.append(instructionScroll, instructionFooter);
+instructionPanel.hidden = true;
+main.append(boardHeader, taskPanel, instructionPanel);
 document.documentElement.lang = locale;
 document.body.append(main, dialog);
 
@@ -329,7 +418,6 @@ function finishMutation(): void {
 }
 let lastRender = "";
 let draggedTask: PanelTask | undefined;
-const reorderType = "application/x-session-tasks-order";
 
 function moveTask(source: PanelTask, target: PanelTask): void {
 	if (mutation || source.id === target.id || target.state !== "queued") return;
@@ -350,6 +438,86 @@ function moveTask(source: PanelTask, target: PanelTask): void {
 			finishMutation();
 		}
 	})();
+}
+
+function taskReorderHandle(task: PanelTask, row: HTMLLIElement): HTMLButtonElement {
+	const grip = element("button", "⠿", "icon-button reorder-handle");
+	grip.type = "button";
+	grip.title = t.reorderHint;
+	grip.setAttribute("aria-label", `${t.reorderTask} · ${task.title}`);
+	grip.setAttribute("aria-keyshortcuts", "ArrowUp ArrowDown");
+
+	function neighbor(offset: number): PanelTask | undefined {
+		const queued = current.filter((entry) => entry.state === "queued");
+		return queued[queued.findIndex((entry) => entry.id === task.id) + offset];
+	}
+	function selectNeighbor(offset: number): void {
+		const target = neighbor(offset);
+		if (target) moveTask(task, target);
+	}
+	grip.onkeydown = (event) => {
+		if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+		event.preventDefault();
+		selectNeighbor(event.key === "ArrowUp" ? -1 : 1);
+	};
+
+	let start: { id: number; x: number; y: number } | undefined;
+	let targetRow: HTMLElement | undefined;
+	let skipClick = false;
+	grip.onpointerdown = (event) => {
+		if (!event.isPrimary || event.button !== 0 || mutation) return;
+		start = { id: event.pointerId, x: event.clientX, y: event.clientY };
+		skipClick = false;
+		grip.setPointerCapture(event.pointerId);
+	};
+	grip.onpointermove = (event) => {
+		if (!start || event.pointerId !== start.id) return;
+		if (!draggedTask && Math.hypot(event.clientX - start.x, event.clientY - start.y) < 5) return;
+		draggedTask = task;
+		row.classList.add("reorder-source");
+		const candidate = document
+			.elementFromPoint(event.clientX, event.clientY)
+			?.closest<HTMLElement>(".task[data-state=queued]");
+		const next = candidate && candidate !== row && rows.contains(candidate) ? candidate : undefined;
+		if (next === targetRow) return;
+		targetRow?.classList.remove("reorder-target");
+		targetRow = next;
+		targetRow?.classList.add("reorder-target");
+	};
+	function endDrag(event: PointerEvent, commit: boolean): void {
+		if (!start || start.id !== event.pointerId) return;
+		const destination = targetRow?.dataset.taskId;
+		const active = draggedTask?.id === task.id;
+		start = undefined;
+		draggedTask = undefined;
+		skipClick = active;
+		row.classList.remove("reorder-source");
+		targetRow?.classList.remove("reorder-target");
+		targetRow = undefined;
+		if (!commit || !active || !destination) return;
+		const target = current.find((entry) => entry.id === destination);
+		if (target) moveTask(task, target);
+	}
+	grip.onpointerup = (event) => endDrag(event, true);
+	grip.onpointercancel = (event) => endDrag(event, false);
+	grip.onlostpointercapture = (event) => endDrag(event, false);
+	grip.onclick = (event) => {
+		if (event.detail > 0 && skipClick) {
+			skipClick = false;
+			return;
+		}
+		dialogHeader(t.reorderTask);
+		const move = (offset: number) => {
+			dialog.close();
+			selectNeighbor(offset);
+		};
+		const up = button(t.moveUp, () => move(-1));
+		const down = button(t.moveDown, () => move(1));
+		up.disabled = !neighbor(-1);
+		down.disabled = !neighbor(1);
+		dialogContent.append(element("p", task.title), group(up, down));
+	};
+	return grip;
 }
 
 function switchList(values: BoardFilter[]): Promise<void> {
@@ -437,6 +605,7 @@ function render(counts: BoardList["counts"]): void {
 	progress.max = Math.max(1, total);
 	progress.value = counts.done;
 	progressText.textContent = total ? `${counts.done}/${total}` : "";
+	taskTab.textContent = total ? `${t.heading} ${total}` : t.heading;
 	progressText.setAttribute("aria-label", t.completed({ done: counts.done, total }));
 	more.hidden = next === null;
 	resume.hidden = counts.queued === 0 || !app.getHostCapabilities()?.message?.text;
@@ -491,53 +660,7 @@ function renderTask(task: PanelTask): HTMLLIElement {
 	line.classList.add("row-title");
 	if (task.state !== "cancelled") line.append(edit);
 	if (task.state === "queued" && current.filter((entry) => entry.state === "queued").length > 1) {
-		const grip = element("button", "⠿", "icon-button reorder-handle");
-		grip.type = "button";
-		grip.draggable = true;
-		grip.title = t.reorderTask;
-		grip.setAttribute("aria-label", `${t.reorderTask} · ${task.title}`);
-		grip.setAttribute("aria-keyshortcuts", "ArrowUp ArrowDown");
-		grip.ondragstart = (event) => {
-			if (mutation || !event.dataTransfer) {
-				event.preventDefault();
-				return;
-			}
-			draggedTask = task;
-			event.dataTransfer.effectAllowed = "move";
-			event.dataTransfer.setData(reorderType, task.id);
-			row.classList.add("reorder-source");
-		};
-		grip.ondragend = () => {
-			draggedTask = undefined;
-			row.classList.remove("reorder-source");
-			rows.querySelector(".reorder-target")?.classList.remove("reorder-target");
-		};
-		grip.onkeydown = (event) => {
-			if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
-			event.preventDefault();
-			const queued = current.filter((entry) => entry.state === "queued");
-			const index = queued.findIndex((entry) => entry.id === task.id);
-			const target = queued[index + (event.key === "ArrowUp" ? -1 : 1)];
-			if (target) moveTask(task, target);
-		};
-		row.ondragover = (event) => {
-			if (!draggedTask || draggedTask.id === task.id || !event.dataTransfer?.types.includes(reorderType))
-				return;
-			event.preventDefault();
-			event.dataTransfer.dropEffect = "move";
-			row.classList.add("reorder-target");
-		};
-		row.ondragleave = (event) => {
-			if (!(event.relatedTarget instanceof Node) || !row.contains(event.relatedTarget))
-				row.classList.remove("reorder-target");
-		};
-		row.ondrop = (event) => {
-			row.classList.remove("reorder-target");
-			if (!draggedTask || event.dataTransfer?.getData(reorderType) !== draggedTask.id) return;
-			event.preventDefault();
-			event.stopPropagation();
-			moveTask(draggedTask, task);
-		};
+		const grip = taskReorderHandle(task, row);
 		line.append(grip);
 	}
 	summary.append(line);
@@ -569,9 +692,12 @@ function renderTask(task: PanelTask): HTMLLIElement {
 	return row;
 }
 
-function dialogHeader(title: string, fullPane = false): void {
+function dialogHeader(title: string, fullPane = false, instructionEditor = false): void {
+	returnToPreviousView = undefined;
 	refreshDiscussion = undefined;
-	dialog.dataset.layout = fullPane ? "pane" : "dialog";
+	detailFooter.hidden = true;
+	detailFooter.replaceChildren();
+	dialog.dataset.layout = fullPane ? "pane" : instructionEditor ? "instruction" : "dialog";
 	dialogContent.ondragover = null;
 	dialogContent.ondragleave = null;
 	dialogContent.ondrop = null;
@@ -580,82 +706,413 @@ function dialogHeader(title: string, fullPane = false): void {
 	const heading = element("h2", title);
 	heading.id = "task-dialog-title";
 	const back = button(
-		fullPane ? `‹ ${t.heading}` : "‹",
-		() => {
-			if (!mutation) dialog.close();
-		},
+		fullPane || instructionEditor ? `‹ ${instructionPanel.hidden ? t.heading : t.instructions}` : "‹",
+		goBackInPanel,
 		"icon-button back",
 	);
 	back.setAttribute("aria-label", t.close);
-	if (fullPane) {
+	if (fullPane || instructionEditor) {
 		const header = element("header", undefined, "task-detail-header");
 		header.append(back, heading);
 		dialogContent.replaceChildren(header);
 	} else dialogContent.replaceChildren(group(back, heading));
 	if (!dialog.open) dialog.showModal();
+	else back.focus();
 }
 
-async function showInstructions(): Promise<void> {
-	dialogHeader(t.instructions);
-	const heading = dialogContent.querySelector("h2");
-	const loading = element("p", t.loading, "notice");
-	dialogContent.append(loading);
+let instructionRequest = 0;
+let instructionSignature = "";
+let deferredInstruction: string | undefined;
+let instructionProjects: InstructionProject[] = [];
+
+function instructionScopeName(entry: PresentedInstruction): string {
+	if (entry.projectId)
+		return (
+			instructionProjects.find((project) => project.id === entry.projectId)?.name ?? t.instructionProject
+		);
+	return entry.permanent ? t.instructionsAllChats : t.instructionsThisChat;
+}
+
+async function saveInstruction(entry: InstructionEntryWrite): Promise<void> {
+	const board = scope;
+	const saved = await call<{ entryId: string; deferred?: boolean }>("save_instruction_entry", {
+		entry,
+		reformulate: locale,
+		manageProjects: true,
+	});
+	if (scope !== board) return;
+	if (saved.deferred) deferredInstruction = saved.entryId;
+	else if (deferredInstruction === saved.entryId || deferredInstruction === entry.entryId)
+		deferredInstruction = undefined;
+}
+
+async function refreshInstructionProjects(): Promise<void> {
 	const board = scope;
 	try {
-		const current = await call<BoardInstructions>("instructions");
-		if (!dialog.open || !heading?.isConnected || scope !== board) return;
-		const form = element("form");
-		const chatInput = element("textarea");
-		const permanentInput = element("textarea");
-		chatInput.maxLength = permanentInput.maxLength = MAX_BOARD_INSTRUCTIONS_BYTES;
-		chatInput.value = current.chat.body;
-		permanentInput.value = current.permanent.body;
-		const chatEditor = markdownEditor(t.instructionsThisChat, chatInput);
-		const permanentEditor = markdownEditor(t.instructionsAllChats, permanentInput);
-		const save = taskSubmit(t.save, "primary");
-		const feedback = element("p", undefined, "notice");
-		feedback.setAttribute("role", "status");
-		form.append(
-			element("p", t.instructionsEveryTurn, "meta"),
-			chatEditor.wrapper,
-			permanentEditor.wrapper,
-			group(save),
-			feedback,
+		const { projects } = await call<{ projects: InstructionProject[] }>("instruction_projects");
+		if (scope === board) instructionProjects = projects;
+	} catch {
+		if (scope === board) instructionProjects = [];
+	}
+}
+
+function selectBoardTab(showInstructions: boolean): void {
+	const changed = instructionPanel.hidden === showInstructions;
+	instructionPanel.hidden = !showInstructions;
+	taskPanel.hidden = showInstructions;
+	taskTab.tabIndex = showInstructions ? -1 : 0;
+	instructionTab.tabIndex = showInstructions ? 0 : -1;
+	taskTab.setAttribute("aria-selected", String(!showInstructions));
+	instructionTab.setAttribute("aria-selected", String(showInstructions));
+	if (!changed) return;
+	if (showInstructions) void refreshInstructionProjects().then(refreshInstructions);
+	else void refresh(true);
+}
+
+function instructionTitle(entry: PresentedInstruction): string {
+	const firstLine = entry.body.split(/\r?\n/u).find((line) => line.trim()) ?? "";
+	const title =
+		entry.reformulation?.title ?? (markdownBlock(firstLine.trim()).textContent?.trim() || t.instruction);
+	const characters = Array.from(title);
+	return characters.length > 96 ? `${characters.slice(0, 96).join("")}…` : title;
+}
+
+async function refreshInstructions(): Promise<void> {
+	if (!scope || instructionPanel.hidden) return;
+	const board = scope;
+	const generation = ++instructionRequest;
+	try {
+		const { instructions } = await call<{ instructions: PresentedInstruction[] }>("instruction_entries", {
+			manageProjects: true,
+		});
+		if (scope !== board || generation !== instructionRequest) return;
+		if (
+			deferredInstruction &&
+			!instructions.some(
+				(entry) => entry.id === deferredInstruction && !entry.reformulation && !entry.reformulationPending,
+			)
+		)
+			deferredInstruction = undefined;
+		instructionNotice.textContent = deferredInstruction
+			? t.instructionModelBusy
+			: instructions.length
+				? ""
+				: t.instructionsEmpty;
+		instructionTab.textContent = instructions.length
+			? `${t.instructions} ${instructions.length}`
+			: t.instructions;
+		const signature = JSON.stringify([instructions, instructionProjects]);
+		if (signature === instructionSignature) return;
+		instructionSignature = signature;
+		const active = document.activeElement?.closest<HTMLElement>("[data-instruction-id]");
+		const action =
+			document.activeElement instanceof HTMLElement
+				? document.activeElement.dataset.instructionAction
+				: undefined;
+		instructionList.replaceChildren(
+			...instructions.map((entry) => {
+				const title = entry.reformulationPending ? t.instructionTitlePending : instructionTitle(entry);
+				const row = element("li", undefined, "task instruction-row");
+				row.dataset.instructionId = entry.id;
+				const icon = element("span", "≡", "instruction-icon");
+				icon.setAttribute("aria-hidden", "true");
+				const edit = button("✎", () => showInstructionEditor(entry), "icon-button row-edit");
+				edit.setAttribute("aria-label", `${t.edit} · ${title}`);
+				edit.dataset.instructionAction = "edit";
+				const toggle = button(title, () => showInstructionDetails(entry), "task-title");
+				toggle.dataset.instructionAction = "toggle";
+				const line = group(toggle, edit);
+				line.classList.add("row-title");
+				const copy = element("div", undefined, "task-copy");
+				copy.append(line, element("span", instructionScopeName(entry), "meta"));
+				if (entry.reformulationFailed) copy.append(element("small", t.instructionModelFailed, "meta"));
+				row.append(icon, copy);
+				return row;
+			}),
 		);
-		loading.replaceWith(form);
-		chatInput.focus();
-		form.onsubmit = async (event) => {
-			event.preventDefault();
-			if (mutation || scope !== board) return;
-			const changes: InstructionChanges = {};
-			if (chatInput.value !== current.chat.body) changes.chat = { ...current.chat, body: chatInput.value };
-			if (permanentInput.value !== current.permanent.body)
-				changes.permanent = { ...current.permanent, body: permanentInput.value };
-			if (!instructionChanges.safeParse(changes).success) {
-				feedback.textContent = t.taskTextTooLong;
+		if (active?.dataset.instructionId) {
+			instructionList
+				.querySelector<HTMLElement>(
+					`[data-instruction-id="${CSS.escape(active.dataset.instructionId)}"] [data-instruction-action="${action ?? "toggle"}"]`,
+				)
+				?.focus({ preventScroll: true });
+		}
+	} catch {
+		if (scope === board && generation === instructionRequest) instructionNotice.textContent = t.error;
+	}
+}
+
+function showInstructionDetails(entry: PresentedInstruction): void {
+	dialogHeader(instructionTitle(entry), false, true);
+	const content = element("section", undefined, "instruction-reading");
+	content.append(element("h3", t.instructionContent), markdownBlock(entry.reformulation?.body ?? entry.body));
+	dialogContent.append(element("p", instructionScopeName(entry), "meta"), content);
+	if (entry.reformulation) {
+		const original = element("details", undefined, "revision-original");
+		original.append(element("summary", t.originalText), element("pre", entry.body));
+		dialogContent.append(original);
+	}
+	dialogContent.append(
+		group(
+			button(t.edit, () => {
+				showInstructionEditor(entry);
+				returnToPreviousView = () => showInstructionDetails(entry);
+			}),
+			button(t.remove, () => confirmInstructionRemoval(entry)),
+		),
+	);
+}
+
+function confirmInstructionRemoval(entry: PresentedInstruction): void {
+	dialogHeader(t.removeInstruction);
+	const feedback = element("p", undefined, "notice");
+	feedback.setAttribute("role", "status");
+	const confirm = button(t.remove, () => void remove(), "primary");
+	async function remove(): Promise<void> {
+		if (mutation) return;
+		const board = scope;
+		mutation = true;
+		confirm.disabled = true;
+		try {
+			await call("remove_instruction_entry", {
+				entryId: entry.id,
+				expectedRevision: entry.revision,
+				manageProjects: true,
+			});
+			if (scope === board) {
+				dialog.close();
+				void refreshInstructions();
+			}
+		} catch (error) {
+			feedback.textContent =
+				error instanceof Error && error.message === "conflict" ? t.instructionsConflict : t.error;
+		} finally {
+			confirm.disabled = false;
+			finishMutation();
+		}
+	}
+	dialogContent.append(element("p", instructionTitle(entry)), group(confirm), feedback);
+}
+
+function showInstructionEditor(entry?: PresentedInstruction, initialContext?: TransferredContext): void {
+	dialogHeader(entry ? t.editInstruction : t.addInstruction, false, true);
+	const form = element("form");
+	form.setAttribute("aria-labelledby", "task-dialog-title");
+	const input = element("textarea");
+	input.name = "instruction";
+	input.required = true;
+	input.maxLength = MAX_BOARD_INSTRUCTIONS_BYTES;
+	input.rows = 6;
+	input.value = entry?.body ?? "";
+	let source = { displayed: input.value, body: entry?.body ?? "" };
+	const readDraft = () => (input.value === source.displayed ? source.body : input.value);
+	const choices = element("fieldset", undefined, "instruction-audience");
+	const segments = element("div", undefined, "instruction-segments");
+	choices.append(element("legend", t.instructionScope), segments);
+	const audience = entry?.projectId ? "project" : entry?.permanent ? "all" : "chat";
+	for (const [value, caption] of [
+		["chat", t.instructionsThisChat],
+		["all", t.instructionsAllChats],
+		["project", t.instructionProjectOption],
+	] as const) {
+		const option = element("input");
+		option.type = "radio";
+		option.name = "audience";
+		option.value = value;
+		option.checked = audience === value;
+		const label = element("label");
+		label.append(option, element("span", caption));
+		segments.append(label);
+	}
+	const scopeHint = element("p", undefined, "instruction-hint");
+	scopeHint.id = "instruction-scope-hint";
+	choices.setAttribute("aria-describedby", scopeHint.id);
+	const projectField = element("fieldset", undefined, "instruction-project");
+	const projectRows = element("div", undefined, "instruction-project-rows");
+	projectField.append(element("legend", t.instructionProject), projectRows);
+	const projectStatus = element("p", t.noInstructionProjects, "instruction-project-empty");
+	projectStatus.setAttribute("role", "status");
+	const target = element("div", undefined, "instruction-scope");
+	target.append(choices, scopeHint, projectField, projectStatus);
+	const save = taskSubmit(t.save, "primary");
+	let importing = false;
+	let selectedProject = entry?.projectId ?? "";
+	const selectedAudience = () => new FormData(form).get("audience") ?? audience;
+	const updateProjectField = () => {
+		const scope = selectedAudience();
+		const active = scope === "project";
+		const available = projectRows.hasChildNodes();
+		projectField.hidden = !(active && available);
+		projectField.disabled = !active;
+		projectStatus.hidden = !active || available;
+		scopeHint.textContent =
+			scope === "chat"
+				? t.instructionScopeChat
+				: scope === "all"
+					? t.instructionScopeAll
+					: t.instructionScopeProject;
+		save.disabled = importing || form.inert || (active && !projectRows.querySelector(":checked"));
+	};
+	const fillProjects = () => {
+		if (projectRows.contains(document.activeElement)) return;
+		projectRows.replaceChildren(
+			...instructionProjects.map(({ id, name, chatCount }) => {
+				const option = element("input");
+				option.type = "radio";
+				option.name = "project";
+				option.value = id;
+				option.checked = id === selectedProject;
+				option.onchange = () => {
+					selectedProject = option.value;
+					updateProjectField();
+				};
+				const label = element("label", undefined, "instruction-project-row");
+				const check = element("span", "✓", "instruction-project-check");
+				check.setAttribute("aria-hidden", "true");
+				const title = element("span", name, "instruction-project-name");
+				label.append(option, check, title);
+				if (chatCount !== undefined)
+					label.append(element("span", t.instructionProjectChats(chatCount), "instruction-project-count"));
+				return label;
+			}),
+		);
+		updateProjectField();
+	};
+	choices.onchange = updateProjectField;
+	void refreshInstructionProjects().then(() => {
+		if (form.isConnected) fillProjects();
+	});
+	const feedback = element("p", undefined, "notice");
+	feedback.setAttribute("role", "status");
+	const cancel = button(t.cancelInstructionEdit, goBackInPanel);
+	const textHint = element(
+		"p",
+		`${t.instructionTextImport} ${t.instructionGeneratedHelp}`,
+		"instruction-hint",
+	);
+	textHint.id = "instruction-text-import";
+	input.setAttribute("aria-describedby", textHint.id);
+	const textField = element("div", undefined, "instruction-text-field");
+	const editorField = field(t.instruction, input);
+	if (entry)
+		editorField.insertBefore(
+			element("span", t.instructionCurrentTitle(instructionTitle(entry)), "instruction-hint"),
+			input,
+		);
+	textField.append(editorField, textHint, feedback);
+	const buttons = group(cancel, save);
+	buttons.classList.add("instruction-actions");
+	const actions = element("div", undefined, "instruction-footer");
+	if (entry) actions.append(button(t.remove, () => confirmInstructionRemoval(entry)));
+	actions.append(buttons);
+	form.append(textField, target, actions);
+	dialogContent.append(form);
+	fillProjects();
+	input.focus();
+	const entryId = entry?.id ?? newTaskId();
+	async function addText(context: TransferredContext): Promise<void> {
+		if (mutation || importing) return;
+		importing = true;
+		save.disabled = true;
+		try {
+			const [file] = context.files;
+			let text = context.text;
+			if (file) {
+				if (
+					context.files.length !== 1 ||
+					file.size > MAX_BOARD_INSTRUCTIONS_BYTES ||
+					!(/\.(txt|md|markdown)$/iu.test(file.name) || /^text\/(plain|markdown)$/iu.test(file.type))
+				) {
+					feedback.textContent = t.instructionFileError;
+					return;
+				}
+				text = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer());
+				if (text.includes("\0")) {
+					feedback.textContent = t.instructionFileError;
+					return;
+				}
+			}
+			if (!form.isConnected || !dialog.open) return;
+			const appended = appendContextText(readDraft(), text);
+			if (!boardInstructionsBody.safeParse(appended).success) {
+				feedback.textContent = t.instructionsLimit;
 				return;
 			}
-			mutation = true;
-			save.disabled = true;
-			form.inert = true;
-			try {
-				await call("save_instructions", { changes });
-				if (form.isConnected && scope === board) {
-					dialog.close();
-					transferMessage(t.instructionsSaved);
-				}
-			} catch (error) {
-				feedback.textContent =
-					error instanceof Error && error.message === "conflict" ? t.instructionsConflict : t.error;
-			} finally {
-				form.inert = false;
-				save.disabled = false;
-				finishMutation();
-			}
-		};
-	} catch {
-		if (loading.isConnected) loading.textContent = t.error;
+			input.value = appended;
+			source = { displayed: input.value, body: appended };
+			feedback.textContent = "";
+			input.removeAttribute("aria-invalid");
+			input.focus();
+		} catch {
+			feedback.textContent = t.instructionFileError;
+		} finally {
+			importing = false;
+			updateProjectField();
+		}
 	}
+	input.oninput = () => {
+		input.removeAttribute("aria-invalid");
+		feedback.textContent = "";
+	};
+	installDropSurface(form, (context) => void addText(context));
+	form.onpaste = (event) => {
+		const clipboard = event.clipboardData;
+		if (!clipboard) return;
+		if (clipboard.files.length) {
+			event.preventDefault();
+			void addText(captureContext(clipboard));
+		} else if (event.target === input) {
+			const text = clipboard.getData("text/plain").replace(/\r\n?/g, "\n");
+			const draft = input.value.slice(0, input.selectionStart) + text + input.value.slice(input.selectionEnd);
+			if (!boardInstructionsBody.safeParse(draft).success) {
+				event.preventDefault();
+				feedback.textContent = t.instructionsLimit;
+			}
+		}
+	};
+	if (initialContext) void addText(initialContext);
+	form.onsubmit = async (event) => {
+		event.preventDefault();
+		if (mutation || importing) return;
+		const board = scope;
+		const checked = instructionEntryWrite.safeParse({
+			entryId,
+			expectedRevision: entry?.revision ?? 0,
+			body: readDraft(),
+			permanent: selectedAudience() === "all",
+			projectId: selectedAudience() === "project" ? selectedProject : undefined,
+		});
+		if (!checked.success) {
+			feedback.textContent = input.value.trim() ? t.instructionsLimit : t.instructionRequired;
+			input.setAttribute("aria-invalid", "true");
+			input.focus();
+			return;
+		}
+		mutation = true;
+		form.inert = true;
+		save.disabled = true;
+		try {
+			await saveInstruction(checked.data);
+			if (form.isConnected && scope === board) {
+				if (!entry && initialContext && quickInstruction.value === initialContext.text)
+					quickInstruction.value = "";
+				dialog.close();
+				void refreshInstructions();
+			}
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : "";
+			feedback.textContent =
+				reason === "conflict"
+					? t.instructionsConflict
+					: reason === "invalid_context"
+						? t.instructionsLimit
+						: t.error;
+		} finally {
+			form.inert = false;
+			finishMutation();
+			updateProjectField();
+		}
+	};
 }
 
 async function fetchDetails(taskId: string, edit = false): Promise<void> {
@@ -675,7 +1132,6 @@ async function fetchDetails(taskId: string, edit = false): Promise<void> {
 interface DiscussionDraft {
 	text: string;
 	focused: boolean;
-	preview: boolean;
 	pending: { body: string; id: string } | undefined;
 }
 
@@ -720,9 +1176,10 @@ function showDetails(task: PanelDetail, draft?: DiscussionDraft): void {
 		const focused = [...(old?.querySelectorAll("button") ?? [])].indexOf(
 			document.activeElement as HTMLButtonElement,
 		);
-		const originalVisible = Boolean(old?.querySelector("pre.revision-source:not([hidden])"));
+		const originalVisible = Boolean(old?.querySelector(".revision-original[open]"));
 		const revision = renderRevision(shown, shown, false);
-		if (originalVisible) revision.querySelector<HTMLButtonElement>(".revision-format")?.click();
+		const original = revision.querySelector<HTMLDetailsElement>(".revision-original");
+		if (original) original.open = originalVisible;
 		context.replaceChildren(summary, revision);
 		if (focused >= 0) revision.querySelectorAll("button")[focused]?.focus({ preventScroll: true });
 	}
@@ -768,7 +1225,11 @@ function showDetails(task: PanelDetail, draft?: DiscussionDraft): void {
 	if (task.state === "running") actions.append(button(t.recover, () => confirmRecovery(task)));
 	if (task.state !== "cancelled")
 		actions.append(
-			button(t.edit, () => showEditor(task)),
+			button(t.edit, () => {
+				const preserved = readDiscussionDraft?.();
+				showEditor(task);
+				returnToPreviousView = () => showDetails(task, preserved);
+			}),
 			button(t.cancelTask, () => void updateTask("cancel", task)),
 		);
 	if (task.state !== "cancelled") {
@@ -892,9 +1353,9 @@ function showDiscussion(
 	input.required = true;
 	input.maxLength = 8192;
 	input.value = savedDraft?.text ?? "";
-	const editor = markdownEditor(t.addComment, input, savedDraft?.preview);
-	const post = element("button", t.postComment, "detail-publish");
-	post.type = "submit";
+	form.id = "task-comment-form";
+	const post = taskSubmit(t.postComment, "detail-publish");
+	post.setAttribute("form", form.id);
 	const feedback = element("p", undefined, "notice");
 	feedback.setAttribute("role", "status");
 	const readError = element("p", undefined, "notice");
@@ -947,14 +1408,13 @@ function showDiscussion(
 				const updated = await call<PanelDetail>("get", { taskId: task.id });
 				if (!dialog.open || !section.isConnected) return;
 				if (updated.serial !== task.serial) {
-					const scroll = dialog.scrollTop;
+					const scroll = dialogContent.scrollTop;
 					showDetails(updated, {
 						text: input.value,
 						focused: document.activeElement === input,
-						preview: editor.isPreview(),
 						pending: draft,
 					});
-					dialog.scrollTop = scroll;
+					dialogContent.scrollTop = scroll;
 					return;
 				}
 				pendingFormat = Boolean(updated.reformulationPending);
@@ -1008,9 +1468,13 @@ function showDiscussion(
 				body: draft.body,
 			});
 			draft = undefined;
-			if (section.isConnected && dialog.open) dialog.close();
+			if (section.isConnected && dialog.open) {
+				dialog.close();
+				transferMessage(t.commentPublished);
+			}
 		} catch {
 			feedback.textContent = t.error;
+			if (section.isConnected && dialog.open) input.focus();
 		} finally {
 			post.disabled = false;
 			input.readOnly = false;
@@ -1018,11 +1482,14 @@ function showDiscussion(
 	};
 	form.ondragover = (event) => event.stopPropagation();
 	form.ondrop = (event) => event.stopPropagation();
-	const composerActions = group(post);
-	composerActions.classList.add("comment-actions");
-	form.append(editor.wrapper, composerActions, feedback);
+	form.append(field(t.addComment, input), feedback);
 	section.append(element("h3", t.comments), older, list, readError, form);
 	dialogContent.append(section);
+	detailFooter.replaceChildren(
+		button(t.close, () => dialog.close()),
+		post,
+	);
+	detailFooter.hidden = false;
 	if (savedDraft?.focused) input.focus({ preventScroll: true });
 	renderComments();
 	refreshDiscussion = () => load();
@@ -1030,7 +1497,6 @@ function showDiscussion(
 	return () => ({
 		text: input.value,
 		focused: document.activeElement === input,
-		preview: editor.isPreview(),
 		pending: draft,
 	});
 }
@@ -1104,20 +1570,12 @@ function renderRevision(task: PanelDetail, revision: Revision, includeTitle = tr
 	);
 	const formatted = includeTitle ? undefined : task.reformulation;
 	if (!includeTitle && task.reformulationPending) section.append(element("p", t.titlePending, "meta"));
-	if (revision.body || formatted) {
-		const rendered = markdownBlock(formatted?.body ?? revision.body);
-		const raw =
-			formatted && revision.body ? `${revision.title}\n\n${revision.body}` : revision.body || revision.title;
-		const source = element("pre", raw, "revision-source");
-		source.hidden = true;
-		const rawLabel = formatted ? t.originalText : t.markdownText;
-		const toggle = button(rawLabel, () => {
-			source.hidden = !source.hidden;
-			rendered.hidden = !source.hidden;
-			toggle.textContent = source.hidden ? rawLabel : t.markdownPreview;
-		});
-		toggle.classList.add("revision-format");
-		section.append(rendered, source, toggle);
+	if (revision.body || formatted) section.append(markdownBlock(formatted?.body ?? revision.body));
+	if (formatted) {
+		const original = element("details", undefined, "revision-original");
+		const raw = revision.body ? `${revision.title}\n\n${revision.body}` : revision.title;
+		original.append(element("summary", t.originalText), element("pre", raw));
+		section.append(original);
 	}
 	if (revision.attachments.length)
 		section.append(
@@ -1161,14 +1619,18 @@ function showEditor(task?: Task, focusContext = false): void {
 	form.setAttribute("aria-labelledby", "task-dialog-title");
 	const title = element("input");
 	title.name = "title";
-	title.required = Boolean(task);
 	if (task) title.maxLength = 240;
-	title.value = task?.title ?? "";
+	title.value = focusContext ? "" : (task?.title ?? "");
 	const body = element("textarea");
 	body.name = "body";
 	body.maxLength = MAX_TASK_BODY_BYTES;
 	body.value = task?.body ?? "";
-	const editor = markdownEditor(t.detail, body);
+	const initialBody = body.value;
+	const updateTitleHint = () => {
+		title.placeholder = body.value.trim() ? contextTitle({ files: [], text: body.value }, "") : "";
+	};
+	body.oninput = updateTitleHint;
+	updateTitleHint();
 	const mode = element("select");
 	mode.name = "mode";
 	mode.add(new Option(t.auto, "auto"));
@@ -1180,8 +1642,8 @@ function showEditor(task?: Task, focusContext = false): void {
 	status.setAttribute("role", "status");
 	const attachments = makeAttachments(task, status);
 	form.append(
-		field(task ? t.title : t.optionalTitle, title),
-		editor.wrapper,
+		field(t.optionalTitle, title),
+		field(t.detail, body),
 		field(t.delegation, mode),
 		attachments.section,
 		status,
@@ -1191,7 +1653,7 @@ function showEditor(task?: Task, focusContext = false): void {
 		if (context.files.length) attachments.addFiles(context.files);
 		if (context.text) {
 			body.value = appendContextText(body.value, context.text);
-			editor.refresh();
+			updateTitleHint();
 		}
 	};
 	installDropSurface(form, addContext);
@@ -1214,17 +1676,13 @@ function showEditor(task?: Task, focusContext = false): void {
 		event.preventDefault();
 		if (mutation) return;
 		const board = scope;
-		const details = body.value;
+		const details = body.value === initialBody ? (task?.body ?? body.value) : body.value;
 		const providedTitle = title.value.trim();
-		if (task && !providedTitle) {
-			status.textContent = t.title;
-			title.focus();
-			return;
-		}
 		const files = attachments.selectedFiles();
-		if (!providedTitle && !hasContext({ files, text: details })) {
+		const kept = attachments.keep();
+		const retainedName = task?.attachments.find((file) => kept.includes(file.id))?.name;
+		if (!providedTitle && !retainedName && !hasContext({ files, text: details })) {
 			status.textContent = t.addTaskContext;
-			editor.setPreview(false);
 			body.focus();
 			return;
 		}
@@ -1246,7 +1704,11 @@ function showEditor(task?: Task, focusContext = false): void {
 			? titleOnlyInput(title.value)
 			: {
 					title:
-						providedTitle || contextTitle({ files: details.trim() ? [] : files, text: details }, t.newTask),
+						providedTitle ||
+						contextTitle(
+							{ files: details.trim() ? [] : files, text: details.trim() ? details : (retainedName ?? "") },
+							t.newTask,
+						),
 					body: details,
 				};
 		mutation = true;
@@ -1373,10 +1835,11 @@ function makeAttachments(task: Task | undefined, status: HTMLElement) {
 function installDropSurface(
 	target: HTMLElement,
 	receive: (context: TransferredContext, event: DragEvent) => void,
+	enabled = () => true,
 ): void {
 	const clear = () => target.classList.remove("drop-armed");
 	target.ondragover = (event) => {
-		if (!scope || !acceptsContext(event.dataTransfer)) return;
+		if (!scope || !enabled() || !acceptsContext(event.dataTransfer)) return;
 		event.preventDefault();
 		if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
 		target.classList.add("drop-armed");
@@ -1386,7 +1849,7 @@ function installDropSurface(
 	};
 	target.ondrop = (event) => {
 		clear();
-		if (!scope || !event.dataTransfer || !acceptsContext(event.dataTransfer)) return;
+		if (!scope || !enabled() || !event.dataTransfer || !acceptsContext(event.dataTransfer)) return;
 		event.preventDefault();
 		event.stopPropagation();
 		const context = captureContext(event.dataTransfer);
@@ -1519,9 +1982,27 @@ function openDropEditor(task: Task, board: string, wake: boolean): void {
 	}
 }
 
-installDropSurface(main, (context) => void saveDroppedContext(context));
+installDropSurface(
+	main,
+	(context) => void saveDroppedContext(context),
+	() => Boolean(instructionPanel.hidden),
+);
+installDropSurface(
+	instructionPanel,
+	(context) => {
+		if (!mutation && !dialog.open) showInstructionEditor(undefined, context);
+	},
+	() => !instructionPanel.hidden,
+);
 document.addEventListener("paste", (event) => {
-	if (!scope || dialog.open || !event.clipboardData || !acceptsContext(event.clipboardData)) return;
+	if (
+		!scope ||
+		!instructionPanel.hidden ||
+		dialog.open ||
+		!event.clipboardData ||
+		!acceptsContext(event.clipboardData)
+	)
+		return;
 	if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
 	const context = captureContext(event.clipboardData);
 	if (!hasContext(context)) return;
@@ -1535,7 +2016,15 @@ app.ontoolresult = (result) => {
 	scope = binding.data;
 	dialog.close();
 	add.disabled = false;
-	instructionsButton.disabled = false;
+	instructionAdd.disabled = false;
+	instructionSignature = "";
+	deferredInstruction = undefined;
+	instructionProjects = [];
+	instructionTab.textContent = t.instructions;
+	quickInstruction.value = "";
+	unsavedInstruction = undefined;
+	instructionList.replaceChildren();
+	if (!instructionPanel.hidden) void refreshInstructionProjects().then(refreshInstructions);
 	quickTitle.disabled = false;
 	quickSubmit.disabled = false;
 	for (const { toggle } of filterButtons) toggle.disabled = false;
@@ -1556,6 +2045,7 @@ try {
 const timer = window.setInterval(() => {
 	if (document.hidden || mutation) return;
 	if (dialog.open) void refreshDiscussion?.();
-	else void refresh();
+	else if (instructionPanel.hidden) void refresh();
+	else void refreshInstructions();
 }, POLL_MS);
 window.addEventListener("pagehide", () => window.clearInterval(timer), { once: true });
