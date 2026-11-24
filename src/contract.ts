@@ -65,26 +65,41 @@ export interface BoardInstructions {
 }
 export const instructionEntryId = z.union([id, z.enum(["chat", "permanent"])]);
 export const instructionProjectId = z.uuid();
+export const MAX_INSTRUCTION_TARGETS = 100;
 export const instructionTarget = z.discriminatedUnion("kind", [
 	z.object({ kind: z.literal("chat") }).strict(),
 	z.object({ kind: z.literal("global") }).strict(),
 	z.object({ kind: z.literal("project"), projectId: instructionProjectId }).strict(),
+	z
+		.object({
+			kind: z.literal("projects_except"),
+			projectIds: z
+				.array(instructionProjectId)
+				.max(MAX_INSTRUCTION_TARGETS)
+				.refine((ids) => new Set(ids).size === ids.length),
+		})
+		.strict(),
 ]);
 export type InstructionTarget = z.infer<typeof instructionTarget>;
+export function instructionTargetKey(target: InstructionTarget): string {
+	return target.kind === "projects_except"
+		? JSON.stringify([target.kind, [...target.projectIds].sort()])
+		: JSON.stringify(target);
+}
 export type InstructionBinding = InstructionTarget | { kind: "other_chat" };
 export interface InstructionProject {
 	id: string;
 	name: string;
 	chatCount?: number;
 }
-export const MAX_INSTRUCTION_TARGETS = 100;
 const distinctInstructionTargets = (values: InstructionTarget[]): boolean =>
 	new Set(values.map((target) => (target.kind === "project" ? target.projectId : target.kind))).size ===
 	values.length;
 export const instructionTargets = z
 	.array(instructionTarget)
 	.max(MAX_INSTRUCTION_TARGETS)
-	.refine(distinctInstructionTargets);
+	.refine(distinctInstructionTargets)
+	.refine((values) => values.length === 1 || values.every((target) => target.kind !== "projects_except"));
 
 export const instructionEntryWrite = z
 	.object({

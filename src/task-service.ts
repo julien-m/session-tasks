@@ -14,6 +14,7 @@ import {
 	type InstructionTarget,
 	instructionChanges,
 	instructionEntryWrite,
+	instructionTargets,
 	MAX_FILE_BYTES,
 	MAX_UPLOAD_BYTES,
 	manualCheck,
@@ -148,6 +149,15 @@ export class TaskService {
 		const projects =
 			checked.data.targets?.flatMap((target) => (target.kind === "project" ? [target.projectId] : [])) ??
 			(checked.data.projectId ? [checked.data.projectId] : []);
+		const audience = checked.data.targets?.[0];
+		if (audience?.kind === "projects_except") {
+			const available = this.listInstructionProjects(scope);
+			if (
+				!manageProjects ||
+				(available.length && available.every(({ id }) => audience.projectIds.includes(id)))
+			)
+				throw new TaskError("invalid_context");
+		}
 		this.validateInstructionProjects(scope, projects, manageProjects);
 		return this.store.saveInstructionEntry(
 			scope,
@@ -173,6 +183,7 @@ export class TaskService {
 		bindings: InstructionTarget[],
 		active: boolean,
 	): { entryId: string; revision: number } {
+		if (!instructionTargets.min(1).safeParse(bindings).success) throw new TaskError("invalid_context");
 		if (active)
 			this.validateInstructionProjects(
 				scope,

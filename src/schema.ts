@@ -69,6 +69,18 @@ CREATE TABLE IF NOT EXISTS instruction_binding (
   PRIMARY KEY(entry_id,kind,target)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS instruction_binding_target ON instruction_binding(kind,target,entry_id);
+CREATE TABLE IF NOT EXISTS instruction_project_audience (
+  entry_id TEXT NOT NULL PRIMARY KEY REFERENCES instruction_entry(id) ON DELETE CASCADE
+) STRICT;
+CREATE TABLE IF NOT EXISTS instruction_project_exclusion (
+  entry_id TEXT NOT NULL REFERENCES instruction_project_audience(entry_id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL CHECK(
+    length(project_id)=36 AND substr(project_id,9,1)='-' AND substr(project_id,14,1)='-'
+    AND substr(project_id,19,1)='-' AND substr(project_id,24,1)='-'
+    AND length(replace(project_id,'-',''))=32 AND lower(replace(project_id,'-','')) NOT GLOB '*[^0-9a-f]*'
+  ),
+  PRIMARY KEY(entry_id,project_id)
+) STRICT;
 CREATE TABLE IF NOT EXISTS instruction_legacy_alias (
   kind TEXT NOT NULL CHECK(kind IN ('chat','global')),
   target TEXT NOT NULL CHECK((kind='global' AND target='') OR (kind='chat' AND length(target)=36)),

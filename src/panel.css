@@ -1378,6 +1378,9 @@ dialog[data-layout="instruction"] h2 {
 	.instruction-segments {
 		grid-template-columns: repeat(3, minmax(0, 1fr));
 	}
+	.instruction-segments-with-exclusions {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
 	.instruction-segments label {
 		justify-content: center;
 		min-block-size: 25px;
@@ -1385,6 +1388,11 @@ dialog[data-layout="instruction"] h2 {
 	.instruction-text-field :where(textarea) {
 		min-block-size: 136px;
 	}
+}
+.instruction-excluded-projects {
+	margin: 0;
+	padding-inline-start: var(--space-md);
+	overflow-wrap: anywhere;
 }
 .detail-footer[hidden] {
 	display: none;

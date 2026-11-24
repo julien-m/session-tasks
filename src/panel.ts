@@ -29,6 +29,7 @@ import {
 	type InstructionTarget,
 	id,
 	instructionEntryWrite,
+	instructionTargetKey,
 	MAX_BOARD_INSTRUCTIONS_BYTES,
 	MAX_COMMENT_BYTES,
 	MAX_INSTRUCTION_TARGETS,
@@ -1098,6 +1099,7 @@ function selectInstructionHistory(history: boolean): void {
 }
 
 function instructionBindingName(binding: InstructionBinding): string {
+	if (binding.kind === "projects_except") return t.instructionExceptBinding(binding.projectIds.length);
 	if (binding.kind === "project")
 		return (
 			instructionProjects.find((project) => project.id === binding.projectId)?.name ?? t.instructionProject
@@ -1119,7 +1121,10 @@ function appliesHere(binding: InstructionBinding): boolean {
 	return (
 		binding.kind === "global" ||
 		binding.kind === "chat" ||
-		(binding.kind === "project" && binding.projectId === currentInstructionProject)
+		(binding.kind === "project" && binding.projectId === currentInstructionProject) ||
+		(binding.kind === "projects_except" &&
+			currentInstructionProject !== undefined &&
+			!binding.projectIds.includes(currentInstructionProject))
 	);
 }
 
@@ -1570,6 +1575,14 @@ function showInstructionDetails(entry: PresentedInstruction): void {
 		const remove = button(t.detachInstruction, () => void detachInstruction(entry, binding));
 		remove.setAttribute("aria-label", `${t.detachInstruction} · ${label}`);
 		bindings.append(group(element("span", label, "meta"), remove));
+		if (binding.kind === "projects_except" && binding.projectIds.length) {
+			const excluded = element("ul", undefined, "instruction-excluded-projects");
+			for (const projectId of binding.projectIds)
+				excluded.append(
+					element("li", instructionProjects.find((project) => project.id === projectId)?.name ?? projectId),
+				);
+			bindings.append(excluded);
+		}
 	}
 	const feedback = element("p", undefined, "notice");
 	feedback.dataset.instructionFeedback = "";
@@ -1591,7 +1604,9 @@ function showInstructionDetails(entry: PresentedInstruction): void {
 				showInstructionEditor(entry);
 				returnToPreviousView = () => showInstructionDetails(entry);
 			}),
-			button(t.attachInstruction, () => showInstructionAssignment(entry)),
+			...(!entry.bindings?.some((binding) => binding.kind === "projects_except")
+				? [button(t.attachInstruction, () => showInstructionAssignment(entry))]
+				: []),
 			...(instructionHistory && entry.bindings?.length === 0
 				? [button(t.deleteInstruction, () => confirmInstructionDeletion(entry), "instruction-delete")]
 				: []),
@@ -1643,9 +1658,15 @@ function showInstructionAssignment(entry: PresentedInstruction): void {
 	const save = taskSubmit(t.applyInstruction, "primary");
 	const feedback = element("p", undefined, "notice");
 	feedback.setAttribute("role", "status");
-	const selection = instructionTargetFields(form, () => {
-		save.disabled = form.inert || selection.targets().length === 0;
-	});
+	const selection = instructionTargetFields(
+		form,
+		() => {
+			save.disabled = form.inert || selection.targets().length === 0;
+		},
+		undefined,
+		undefined,
+		entry.bindings?.length === 0,
+	);
 	const actions = group(button(t.cancelInstructionEdit, goBackInPanel), save);
 	actions.classList.add("instruction-actions");
 	form.append(selection.section, feedback, actions);
@@ -1729,24 +1750,28 @@ function instructionTargetFields(
 	onChange: () => void,
 	initialTargets: InstructionTarget[] = [{ kind: "chat" }],
 	onUserChange: () => void = () => {},
+	allowExclusions = false,
 ) {
 	const choices = element("fieldset", undefined, "instruction-audience");
 	const segments = element("div", undefined, "instruction-segments");
 	choices.append(element("legend", t.instructionScope), segments);
 	const kind = initialTargets[0]?.kind;
 	const singleAudience = kind && initialTargets.every((target) => target.kind === kind);
-	const audience = singleAudience
-		? kind === "global"
-			? "all"
-			: kind === "project"
-				? "project"
-				: "chat"
-		: "";
-	for (const [value, caption] of [
-		["chat", t.instructionsThisChat],
-		["all", t.instructionsAllChats],
-		["project", t.instructionProjectOption],
-	] as const) {
+	const audience = singleAudience ? kind : "";
+	const options = allowExclusions
+		? ([
+				["chat", t.instructionsThisChat],
+				["project", t.instructionProjectsSelected],
+				["projects_except", t.instructionProjectsExcept],
+				["global", t.instructionEverywhere],
+			] as const)
+		: ([
+				["chat", t.instructionsThisChat],
+				["global", t.instructionsAllChats],
+				["project", t.instructionProjectOption],
+			] as const);
+	if (allowExclusions) segments.classList.add("instruction-segments-with-exclusions");
+	for (const [value, caption] of options) {
 		const option = element("input");
 		option.type = "radio";
 		option.name = "audience";
@@ -1769,7 +1794,8 @@ function instructionTargetFields(
 	projectActions.classList.add("instruction-project-actions");
 	const projectToolbar = group(projectCount, projectActions);
 	projectToolbar.classList.add("instruction-project-toolbar");
-	projectField.append(element("legend", t.instructionProject), projectToolbar, projectRows);
+	const projectLegend = element("legend", t.instructionProject);
+	projectField.append(projectLegend, projectToolbar, projectRows);
 	const projectStatus = element("p", t.noInstructionProjects, "instruction-project-empty");
 	projectStatus.setAttribute("role", "status");
 	const target = element("div", undefined, "instruction-scope");
@@ -1777,29 +1803,53 @@ function instructionTargetFields(
 	const selectedProjects = new Set(
 		initialTargets.flatMap((target) => (target.kind === "project" ? [target.projectId] : [])),
 	);
+	const excludedProjects = new Set(
+		initialTargets.find((target) => target.kind === "projects_except")?.projectIds,
+	);
+	const originalExclusions = [...excludedProjects];
+	const selectedAudience = () => new FormData(form).get("audience") ?? audience;
+	const projectSelection = () =>
+		selectedAudience() === "projects_except" ? excludedProjects : selectedProjects;
 	const projectInputs = () => projectRows.querySelectorAll<HTMLInputElement>("input[type=checkbox]");
 	function selectProjects(checked: boolean): void {
 		onUserChange();
-		selectedProjects.clear();
-		for (const option of projectInputs()) {
-			option.checked = checked;
-			if (checked) selectedProjects.add(option.value);
-		}
+		const selection = projectSelection();
+		if (selection === selectedProjects) selection.clear();
+		if (checked) for (const { id } of instructionProjects) selection.add(id);
+		else selection.clear();
 		updateProjectField();
 	}
-	const selectedAudience = () => new FormData(form).get("audience") ?? audience;
+	const allProjectsExcluded = () =>
+		instructionProjects.length > 0 && instructionProjects.every(({ id }) => excludedProjects.has(id));
 	const updateProjectField = () => {
 		const scope = selectedAudience();
-		const active = scope === "project";
-		const options = projectInputs();
-		const available = options.length > 0;
-		const count = selectedProjects.size;
-		const overBulkLimit = options.length > MAX_INSTRUCTION_TARGETS;
-		projectCount.textContent = t.instructionSelectedProjects(count, options.length);
-		selectAll.disabled = !available || count === options.length || overBulkLimit;
-		clearAll.disabled = count === 0;
-		for (const option of options) option.disabled = !option.checked && count >= MAX_INSTRUCTION_TARGETS;
-		projectField.hidden = !(active && available);
+		const excluding = scope === "projects_except";
+		const active = scope === "project" || excluding;
+		const total = instructionProjects.length;
+		const available = total > 0;
+		const selection = projectSelection();
+		const count = instructionProjects.filter(({ id }) => selection.has(id)).length;
+		const overBulkLimit = total + selection.size - count > MAX_INSTRUCTION_TARGETS;
+		projectLegend.textContent = excluding
+			? t.instructionExcludeProjects
+			: allowExclusions
+				? t.instructionIncludeProjects
+				: t.instructionProject;
+		projectCount.textContent = allowExclusions
+			? t.instructionProjectsCovered(excluding ? total - count : count, total)
+			: t.instructionSelectedProjects(count, total);
+		selectAll.disabled = !available || count === total || overBulkLimit;
+		clearAll.disabled = selection.size === 0;
+		let hasUnavailable = false;
+		for (const option of projectInputs()) {
+			if (option.dataset.unavailable && option.parentElement) {
+				option.parentElement.hidden = !excluding;
+				hasUnavailable ||= excluding;
+			}
+			option.checked = selection.has(option.value);
+			option.disabled = !option.checked && selection.size >= MAX_INSTRUCTION_TARGETS;
+		}
+		projectField.hidden = !(active && (available || hasUnavailable));
 		projectField.disabled = !active;
 		projectStatus.hidden = !active || available;
 		scopeHint.textContent =
@@ -1807,26 +1857,46 @@ function instructionTargetFields(
 				? t.instructionChooseScope
 				: scope === "chat"
 					? t.instructionScopeChat
-					: scope === "all"
-						? t.instructionScopeAll
-						: overBulkLimit
-							? t.instructionProjectLimit(MAX_INSTRUCTION_TARGETS)
-							: t.instructionScopeProject;
+					: scope === "global"
+						? allowExclusions
+							? t.instructionScopeEverywhere
+							: t.instructionScopeAll
+						: excluding
+							? allProjectsExcluded()
+								? t.instructionAllProjectsExcluded
+								: t.instructionScopeExcept
+							: overBulkLimit
+								? t.instructionProjectLimit(MAX_INSTRUCTION_TARGETS)
+								: allowExclusions
+									? t.instructionScopeSelected
+									: t.instructionScopeProject;
 		onChange();
 	};
 	const fillProjects = () => {
 		if (projectField.contains(document.activeElement)) return;
+		const availableIds = new Set(instructionProjects.map(({ id }) => id));
+		const unavailable = originalExclusions.filter((id) => !availableIds.has(id));
+		const projects = [
+			...instructionProjects.map((project) => ({ ...project, unavailable: false })),
+			...unavailable.map((id) => ({
+				id,
+				name: t.unavailableInstructionProject(id),
+				chatCount: undefined,
+				unavailable: true,
+			})),
+		];
 		projectRows.replaceChildren(
-			...instructionProjects.map(({ id, name, chatCount }) => {
+			...projects.map(({ id, name, chatCount, unavailable }) => {
 				const option = element("input");
 				option.type = "checkbox";
 				option.name = "project";
 				option.value = id;
-				option.checked = selectedProjects.has(id);
+				if (unavailable) option.dataset.unavailable = "true";
 				option.onchange = () => {
 					onUserChange();
-					if (option.checked) selectedProjects.add(id);
-					else selectedProjects.delete(id);
+					const selection = projectSelection();
+					if (option.checked) selection.add(id);
+					else selection.delete(id);
 					updateProjectField();
 				};
 				const label = element("label", undefined, "instruction-project-row");
@@ -1856,7 +1926,9 @@ function instructionTargetFields(
 			if (audience === "") return [];
 			if (audience === "project")
 				return [...selectedProjects].map((projectId) => ({ kind: "project", projectId }));
-			return [{ kind: audience === "all" ? "global" : "chat" }];
+			if (audience === "projects_except")
+				return allProjectsExcluded() ? [] : [{ kind: "projects_except", projectIds: [...excludedProjects] }];
+			return [{ kind: audience === "global" ? "global" : "chat" }];
 		},
 	};
 }
@@ -1880,9 +1952,15 @@ function showInstructionEditor(entry?: PresentedInstruction, initialContext?: Tr
 	};
 	const existingTargets = (entry?.bindings ?? []).filter((binding) => binding.kind !== "other_chat");
 	let scopeTouched = false;
-	const selection = instructionTargetFields(form, updateSave, entry ? existingTargets : undefined, () => {
-		scopeTouched = true;
-	});
+	const selection = instructionTargetFields(
+		form,
+		updateSave,
+		entry ? existingTargets : undefined,
+		() => {
+			scopeTouched = true;
+		},
+		!entry?.bindings?.some((binding) => binding.kind === "other_chat"),
+	);
 	const feedback = element("p", undefined, "notice");
 	feedback.setAttribute("role", "status");
 	const cancel = button(t.cancelInstructionEdit, goBackInPanel);
@@ -1983,7 +2061,10 @@ function showInstructionEditor(entry?: PresentedInstruction, initialContext?: Tr
 			scopeTouched &&
 			(selected.length !== existingTargets.length ||
 				selected.some(
-					(target) => !existingTargets.some((initial) => JSON.stringify(initial) === JSON.stringify(target)),
+					(target) =>
+						!existingTargets.some(
+							(initial) => instructionTargetKey(initial) === instructionTargetKey(target),
+						),
 				));
 		const checked = instructionEntryWrite.safeParse({
 			entryId,

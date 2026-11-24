@@ -16,6 +16,7 @@ import {
 	type InstructionEntry,
 	type InstructionEntryWrite,
 	type InstructionTarget,
+	instructionTargetKey,
 	MAX_PAGE,
 	type Mode,
 	manualCheck,
@@ -410,14 +411,16 @@ export class TaskRepository {
 		const kind = mode === "chat" ? "chat" : "global";
 		const target = mode === "chat" ? scope : "";
 		const alias = this.database
-			.prepare(`SELECT a.entry_id,e.removed FROM instruction_legacy_alias a
-				JOIN instruction_entry e ON e.id=a.entry_id WHERE a.kind=? AND a.target=?`)
-			.get(kind, target) as { entry_id: string; removed: number } | undefined;
-		if (alias?.removed)
+			.prepare(`SELECT a.entry_id,e.removed OR EXISTS (
+				SELECT 1 FROM instruction_project_audience p WHERE p.entry_id=e.id
+			) AS detached FROM instruction_legacy_alias a
+			JOIN instruction_entry e ON e.id=a.entry_id WHERE a.kind=? AND a.target=?`)
+			.get(kind, target) as { entry_id: string; detached: number } | undefined;
+		if (alias?.detached)
 			this.database
 				.prepare("DELETE FROM instruction_legacy_alias WHERE kind=? AND target=?")
 				.run(kind, target);
-		if (alias && !alias.removed) {
+		if (alias && !alias.detached) {
 			const entryId = alias.entry_id;
 			if (body) {
 				this.database
@@ -482,7 +485,7 @@ export class TaskRepository {
 		const rows = this.database
 			.prepare(`SELECT id,revision,body,permanent,projectId,title,formattedBody,createdAt FROM (
 				SELECT 'chat' id,revision,body,0 permanent,NULL projectId,-2 ordinal,NULL title,NULL formattedBody,NULL createdAt
-				FROM board_instructions WHERE scope=? AND body!=''
+				FROM board_instructions WHERE scope=$scope AND body!=''
 				UNION ALL
 				SELECT 'permanent',revision,body,1,NULL,-1,NULL,NULL,NULL FROM permanent_instructions WHERE singleton=1 AND body!=''
 				UNION ALL
@@ -490,23 +493,27 @@ export class TaskRepository {
 					EXISTS(SELECT 1 FROM instruction_binding b WHERE b.entry_id=e.id AND b.kind='global'),
 					(SELECT MIN(b.target) FROM instruction_binding b WHERE b.entry_id=e.id AND b.kind='project'),
 					e.ordinal,${formatColumns},e.created_at
-				FROM instruction_entry e ${formatJoin} WHERE e.removed=0 AND (?=1 OR EXISTS (
+				FROM instruction_entry e ${formatJoin} WHERE e.removed=0 AND ($library=1 OR EXISTS (
 					SELECT 1 FROM instruction_binding b WHERE b.entry_id=e.id AND (
-						b.kind='global' OR (b.kind='chat' AND b.target=?) OR
-						(b.kind='project' AND (b.target=? OR ?=1))
+						b.kind='global' OR (b.kind='chat' AND b.target=$scope) OR
+						(b.kind='project' AND (b.target=$project OR $manageProjects=1))
+					) AND NOT EXISTS (SELECT 1 FROM instruction_project_audience a WHERE a.entry_id=e.id)
+				) OR EXISTS (
+					SELECT 1 FROM instruction_project_audience a WHERE a.entry_id=e.id AND (
+						$manageProjects=1 OR ($project IS NOT NULL AND NOT EXISTS (
+							SELECT 1 FROM instruction_project_exclusion x
+							WHERE x.entry_id=a.entry_id AND x.project_id=$project
+						))
 					)
 				))
-			) ORDER BY CASE WHEN ?=1 AND createdAt IS NULL THEN 1 ELSE 0 END,
-				CASE WHEN ?=1 THEN -ordinal ELSE ordinal END`)
-			.all(
-				scope,
-				Number(library),
-				scope,
-				projectId ?? null,
-				Number(manageProjects),
-				Number(library),
-				Number(library),
-			) as unknown as Array<
+			) ORDER BY CASE WHEN $library=1 AND createdAt IS NULL THEN 1 ELSE 0 END,
+				CASE WHEN $library=1 THEN -ordinal ELSE ordinal END`)
+			.all({
+				$scope: scope,
+				$project: projectId ?? null,
+				$library: Number(library),
+				$manageProjects: Number(manageProjects),
+			}) as unknown as Array<
 			Omit<InstructionEntry, "permanent" | "projectId" | "createdAt"> & {
 				permanent: 0 | 1;
 				projectId: string | null;
@@ -532,9 +539,18 @@ export class TaskRepository {
 	private instructionBindings(scope: string, entryId: string): InstructionBinding[] {
 		if (entryId === "chat") return [{ kind: "chat" }];
 		if (entryId === "permanent") return [{ kind: "global" }];
+		const audience = this.database
+			.prepare("SELECT 1 FROM instruction_project_audience WHERE entry_id=?")
+			.get(entryId);
+		if (audience) {
+			const exclusions = this.database
+				.prepare("SELECT project_id FROM instruction_project_exclusion WHERE entry_id=? ORDER BY project_id")
+				.all(entryId) as { project_id: string }[];
+			return [{ kind: "projects_except", projectIds: exclusions.map(({ project_id }) => project_id) }];
+		}
 		const rows = this.database
 			.prepare("SELECT kind,target FROM instruction_binding WHERE entry_id=? ORDER BY kind,target")
-			.all(entryId) as { kind: InstructionTarget["kind"]; target: string }[];
+			.all(entryId) as { kind: "chat" | "global" | "project"; target: string }[];
 		return rows.map(({ kind, target }) =>
 			kind === "project"
 				? { kind, projectId: target }
@@ -549,6 +565,8 @@ export class TaskRepository {
 			.prepare(`SELECT 1 FROM (
 			SELECT b.kind,b.target,e.body FROM instruction_binding b
 			JOIN instruction_entry e ON e.id=b.entry_id WHERE e.removed=0
+			UNION ALL SELECT 'projects_except','',e.body FROM instruction_project_audience a
+			JOIN instruction_entry e ON e.id=a.entry_id WHERE e.removed=0
 			UNION ALL SELECT 'chat',scope,body FROM board_instructions WHERE body!=''
 			UNION ALL SELECT 'global','',body FROM permanent_instructions WHERE body!=''
 		) GROUP BY kind,target HAVING COUNT(*)>50 OR SUM(length(CAST(body AS BLOB))+2)>16384 LIMIT 1`)
@@ -557,10 +575,44 @@ export class TaskRepository {
 	}
 
 	private addInstructionBinding(scope: string, entryId: string, binding: InstructionTarget): void {
+		if (binding.kind === "projects_except") {
+			// Older clients retain an independent document and its revision when a binding is replaced.
+			this.database
+				.prepare(`INSERT OR IGNORE INTO board_instructions(scope,revision,body)
+				SELECT a.target,e.revision,'' FROM instruction_legacy_alias a
+				JOIN instruction_entry e ON e.id=a.entry_id WHERE a.entry_id=? AND a.kind='chat'`)
+				.run(entryId);
+			this.database
+				.prepare(`INSERT OR IGNORE INTO permanent_instructions(singleton,revision,body)
+				SELECT 1,e.revision,'' FROM instruction_legacy_alias a
+				JOIN instruction_entry e ON e.id=a.entry_id WHERE a.entry_id=? AND a.kind='global'`)
+				.run(entryId);
+			this.database.prepare("DELETE FROM instruction_legacy_alias WHERE entry_id=?").run(entryId);
+			this.database.prepare("INSERT INTO instruction_project_audience(entry_id) VALUES (?)").run(entryId);
+			const insertExclusion = this.database.prepare(
+				"INSERT INTO instruction_project_exclusion(entry_id,project_id) VALUES (?,?)",
+			);
+			for (const projectId of binding.projectIds) insertExclusion.run(entryId, projectId);
+			return;
+		}
 		const target = binding.kind === "project" ? binding.projectId : binding.kind === "chat" ? scope : "";
 		this.database
 			.prepare("INSERT OR IGNORE INTO instruction_binding(entry_id,kind,target) VALUES (?,?,?)")
 			.run(entryId, binding.kind, target);
+	}
+
+	private deleteInstructionBinding(scope: string, entryId: string, binding: InstructionTarget): void {
+		if (binding.kind === "projects_except") {
+			this.database.prepare("DELETE FROM instruction_project_audience WHERE entry_id=?").run(entryId);
+			return;
+		}
+		this.database
+			.prepare("DELETE FROM instruction_binding WHERE entry_id=? AND kind=? AND target=?")
+			.run(
+				entryId,
+				binding.kind,
+				binding.kind === "project" ? binding.projectId : binding.kind === "chat" ? scope : "",
+			);
 	}
 
 	saveInstructionEntry(
@@ -583,20 +635,20 @@ export class TaskRepository {
 				targets ?? [projectId ? { kind: "project", projectId } : { kind: permanent ? "global" : "chat" }];
 			const existing = current ? this.instructionBindings(scope, entryId) : [];
 			const editable = existing.filter((binding) => binding.kind !== "other_chat");
-			const editableKeys = new Set(editable.map((binding) => JSON.stringify(binding)));
+			const editableKeys = new Set(editable.map(instructionTargetKey));
 			const matchesEditableTargets = (values: InstructionTarget[]) =>
 				values.length === editable.length &&
-				values.every((target) => editableKeys.has(JSON.stringify(target)));
+				values.every((target) => editableKeys.has(instructionTargetKey(target)));
 			if (replaceTargetsFrom && !matchesEditableTargets(replaceTargetsFrom)) throw new TaskError("conflict");
 			const sameTargets =
 				(replaceTargetsFrom || editable.length === existing.length) && matchesEditableTargets(requested);
 			if (
 				!targets &&
-				existing.length > 1 &&
-				!requested.every((target) =>
-					existing.some((binding) => JSON.stringify(binding) === JSON.stringify(target)),
-				)
+				(existing.length > 1 || existing[0]?.kind === "projects_except") &&
+				!requested.every((target) => editableKeys.has(instructionTargetKey(target)))
 			)
+				throw new TaskError("conflict");
+			if (requested[0]?.kind === "projects_except" && existing.length !== editable.length)
 				throw new TaskError("conflict");
 			const preserveBindings = !replaceTargetsFrom && (Boolean(targets) || existing.length > 1);
 			const same = current?.body === body && (sameTargets || (preserveBindings && expectedRevision > 0));
@@ -626,6 +678,8 @@ export class TaskRepository {
 						.run(savedId, scope);
 				else if (!preserveBindings)
 					this.database.prepare("DELETE FROM instruction_binding WHERE entry_id=?").run(savedId);
+				if (!preserveBindings)
+					this.database.prepare("DELETE FROM instruction_project_audience WHERE entry_id=?").run(savedId);
 			} else {
 				const result = this.database
 					.prepare(`INSERT INTO instruction_entry(id,scope,project_id,revision,body,created_at)
@@ -659,6 +713,21 @@ export class TaskRepository {
 				(entry) => entry.id === entryId,
 			);
 			if (current?.revision !== expectedRevision) throw new TaskError("conflict");
+			const currentBindings = current.bindings ?? [];
+			const existingExclusive = currentBindings.find((binding) => binding.kind === "projects_except");
+			const exclusive = bindings.find((binding) => binding.kind === "projects_except");
+			if (exclusive || existingExclusive) {
+				const same =
+					exclusive &&
+					existingExclusive &&
+					instructionTargetKey(exclusive) === instructionTargetKey(existingExclusive);
+				if (active && same) return { entryId, revision: expectedRevision };
+				if (!exclusive || (active ? currentBindings.length > 0 : !same)) throw new TaskError("conflict");
+				if (active) this.addInstructionBinding(scope, entryId, exclusive);
+				else this.deleteInstructionBinding(scope, entryId, exclusive);
+				this.checkInstructionCapacity();
+				return { entryId, revision: expectedRevision };
+			}
 			if (entryId === "chat" || entryId === "permanent") {
 				const newId = randomUUID();
 				this.database
@@ -671,14 +740,7 @@ export class TaskRepository {
 			}
 			for (const binding of bindings) {
 				if (active) this.addInstructionBinding(scope, entryId, binding);
-				else
-					this.database
-						.prepare("DELETE FROM instruction_binding WHERE entry_id=? AND kind=? AND target=?")
-						.run(
-							entryId,
-							binding.kind,
-							binding.kind === "project" ? binding.projectId : binding.kind === "chat" ? scope : "",
-						);
+				else this.deleteInstructionBinding(scope, entryId, binding);
 			}
 			this.checkInstructionCapacity();
 			return { entryId, revision: resolvedRevision };
@@ -699,7 +761,7 @@ export class TaskRepository {
 			WHERE id=? AND revision=? AND removed=0 AND (?=1 OR EXISTS (
 				SELECT 1 FROM instruction_binding b WHERE b.entry_id=instruction_entry.id
 				AND (b.kind!='chat' OR b.target=?)
-			))
+			) OR EXISTS (SELECT 1 FROM instruction_project_audience a WHERE a.entry_id=instruction_entry.id))
 			ON CONFLICT(entry_id) DO UPDATE SET revision=excluded.revision,title=excluded.title,body=excluded.body
 			WHERE instruction_reformulation.revision < excluded.revision`)
 			.run(generated.title, generated.body, entryId, revision, Number(library), scope);
@@ -713,6 +775,8 @@ export class TaskRepository {
 				.prepare(`UPDATE instruction_entry SET body='',removed=1,revision=revision+1
 					WHERE id=? AND revision=? AND removed=0 AND NOT EXISTS (
 						SELECT 1 FROM instruction_binding WHERE entry_id=instruction_entry.id
+					) AND NOT EXISTS (
+						SELECT 1 FROM instruction_project_audience WHERE entry_id=instruction_entry.id
 					)`)
 				.run(entryId, expectedRevision);
 			if (!deleted.changes) throw new TaskError("conflict");
@@ -741,13 +805,7 @@ export class TaskRepository {
 			if (bindings.length !== 1) throw new TaskError("conflict");
 			const binding = bindings[0];
 			if (!binding) throw new TaskError("conflict");
-			this.database
-				.prepare("DELETE FROM instruction_binding WHERE entry_id=? AND kind=? AND target=?")
-				.run(
-					entryId,
-					binding.kind,
-					binding.kind === "project" ? binding.projectId : binding.kind === "chat" ? scope : "",
-				);
+			this.deleteInstructionBinding(scope, entryId, binding);
 		});
 	}
 

@@ -1,6 +1,6 @@
 {
 	"name": "session-tasks",
-	"version": "0.5.41",
+	"version": "0.6.0",
 	"description": "Persistent, editable task queue for each Codex chat.",
 	"mcpServers": "./.mcp.json",
 	"hooks": "./hooks/hooks.json",

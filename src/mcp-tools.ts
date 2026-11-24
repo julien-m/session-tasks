@@ -415,7 +415,7 @@ export function createTaskMcp(
 	);
 	agent(
 		"session_tasks_add_instruction",
-		"Create one saved instruction only when the user explicitly requests it. Preserve the user's wording. Supply explicit targets for this chat, the named projects, or all chats only when the user explicitly requests that global scope. Resolve projects with session_tasks_instruction_projects first. Use a new UUID and keep it for retries. The title and display text are generated in the background.",
+		"Create one saved instruction only when the user explicitly requests it. Preserve the user's wording. Supply explicit targets: this chat, named projects, all chats if expressly requested, or one projects_except target for all current and future projects except its projectIds. Projects-only scopes skip chats without a project. Resolve project names with session_tasks_instruction_projects first. Use a new UUID and keep it for retries. The title and display text are generated in the background.",
 		createInstruction,
 		false,
 		({ scope, entryId, body, targets, locale }) => {

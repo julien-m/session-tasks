@@ -981,6 +981,168 @@ test("applies a project instruction only to current members, including after a c
 	expect(service.listInstructionEntries(other)).toEqual([]);
 });
 
+test("applies an exclusion scope at prompt time and after editing or adding projects", () => {
+	const fixture = mkdtempSync(join(tmpdir(), "session-task-project-exclusions-"));
+	resources.push(() => rmSync(fixture, { recursive: true, force: true }));
+	const statePath = join(fixture, "state_5.sqlite");
+	const state = new DatabaseSync(statePath);
+	resources.push(() => state.close());
+	state.exec(`CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, position INTEGER);
+		CREATE TABLE threads (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id));`);
+	const [included, excluded, future] = [randomUUID(), randomUUID(), randomUUID()];
+	const [owner, includedChat, excludedChat, futureChat] = [
+		randomUUID(),
+		randomUUID(),
+		randomUUID(),
+		randomUUID(),
+	];
+	const addProject = state.prepare("INSERT INTO projects VALUES(?, ?, ?)");
+	const addThread = state.prepare("INSERT INTO threads VALUES(?, ?)");
+	addProject.run(included, "Included project", 0);
+	addProject.run(excluded, "Excluded project", 1);
+	addThread.run(owner, null);
+	addThread.run(includedChat, included);
+	addThread.run(excludedChat, excluded);
+	const { database } = harness(join(fixture, "tasks.sqlite3"));
+	const service = new TaskService(new TaskRepository(database), Date.now, localCodexProjects(statePath));
+	const scope = service.bind(owner);
+	const entryId = randomUUID();
+	const saved = { entryId, body: "Check the real surface.", permanent: false };
+	const except = (projectIds: string[]) => ({ kind: "projects_except" as const, projectIds });
+	expect(() =>
+		service.saveInstructionEntry(
+			scope,
+			{
+				...saved,
+				expectedRevision: 0,
+				targets: [except([included, excluded])],
+			},
+			true,
+			true,
+		),
+	).toThrow("invalid_context");
+	service.saveInstructionEntry(
+		scope,
+		{ ...saved, expectedRevision: 0, targets: [except([excluded])] },
+		true,
+		true,
+	);
+	expect(service.listInstructionLibrary(scope)[0]?.bindings).toEqual([except([excluded])]);
+	const read = (thread: string) => service.listInstructionEntries(service.bind(thread)).map(({ id }) => id);
+	const prompt = (thread: string) =>
+		JSON.stringify(taskHook(service, { hook_event_name: "UserPromptSubmit", session_id: thread }));
+	expect(read(includedChat)).toEqual([entryId]);
+	expect(prompt(includedChat)).toContain("Read session_tasks_instructions");
+	expect(read(excludedChat)).toEqual([]);
+	expect(prompt(excludedChat)).toContain("There are no active Session Tasks instructions");
+	expect(read(owner)).toEqual([]);
+	addProject.run(future, "New project", 2);
+	addThread.run(futureChat, future);
+	expect(read(futureChat)).toEqual([entryId]);
+	expect(() => service.deleteUnboundInstruction(scope, entryId, 1)).toThrow("conflict");
+	service.saveInstructionEntry(
+		scope,
+		{
+			...saved,
+			expectedRevision: 1,
+			targets: [except([included])],
+			replaceTargetsFrom: [except([excluded])],
+		},
+		true,
+		true,
+	);
+	expect(read(includedChat)).toEqual([]);
+	expect(read(excludedChat)).toEqual([entryId]);
+	expect(service.listInstructionLibrary(scope)[0]?.bindings).toEqual([except([included])]);
+	expect(() => service.setInstructionBindings(scope, entryId, 2, [{ kind: "global" }], true)).toThrow(
+		"conflict",
+	);
+	expect(() =>
+		database.prepare("INSERT INTO instruction_project_exclusion VALUES(?,?)").run(entryId, "x".repeat(36)),
+	).toThrow("CHECK constraint failed");
+	state.prepare("UPDATE threads SET project_id=NULL WHERE project_id=?").run(included);
+	state.prepare("DELETE FROM projects WHERE id=?").run(included);
+	const detached = service.setInstructionBindings(scope, entryId, 2, [except([included])], false);
+	expect(read(excludedChat)).toEqual([]);
+	service.saveInstructionReformulation(
+		scope,
+		entryId,
+		2,
+		{ title: "Check the surface", body: saved.body },
+		true,
+	);
+	const restored = service.setInstructionBindings(
+		scope,
+		entryId,
+		detached.revision,
+		[except([included])],
+		true,
+	);
+	expect(service.listInstructionLibrary(scope)[0]?.bindings).toEqual([except([included])]);
+	expect(service.listInstructionLibrary(scope)[0]?.reformulation?.title).toBe("Check the surface");
+	service.saveInstructionEntry(
+		scope,
+		{
+			...saved,
+			expectedRevision: restored.revision,
+			targets: [except([])],
+			replaceTargetsFrom: [except([included])],
+		},
+		true,
+		true,
+	);
+	expect(read(includedChat)).toEqual([]);
+	expect(read(excludedChat)).toEqual([entryId]);
+	expect(read(owner)).toEqual([]);
+});
+
+test("keeps a repurposed global instruction project-scoped when a legacy client writes again", () => {
+	const folder = mkdtempSync(join(tmpdir(), "session-task-migrate-exclusions-"));
+	resources.push(() => rmSync(folder, { recursive: true, force: true }));
+	const path = join(folder, "tasks.sqlite3");
+	const old = new DatabaseSync(path);
+	old.exec(SCHEMA);
+	old.prepare("INSERT INTO permanent_instructions VALUES(1,?,?)").run(4, "Original global instruction");
+	old.close();
+	const { database } = harness(path);
+	const [included, excluded, excludedThread] = [randomUUID(), randomUUID(), randomUUID()];
+	const service = new TaskService(new TaskRepository(database), Date.now, {
+		list: () => [
+			{ id: included, name: "Included" },
+			{ id: excluded, name: "Excluded" },
+		],
+		forThread: (thread) => (thread === excludedThread ? excluded : included),
+	});
+	const scope = service.bind(randomUUID());
+	const excludedScope = service.bind(excludedThread);
+	const entry = service.listInstructionLibrary(scope)[0];
+	if (!entry) throw new Error("Missing migrated instruction");
+	expect(entry?.bindings).toEqual([{ kind: "global" }]);
+	service.saveInstructionEntry(
+		scope,
+		{
+			entryId: entry.id,
+			expectedRevision: entry.revision,
+			body: entry.body,
+			permanent: false,
+			targets: [{ kind: "projects_except", projectIds: [excluded] }],
+			replaceTargetsFrom: [{ kind: "global" }],
+		},
+		true,
+		true,
+	);
+	const legacy = service.readInstructions(scope).permanent;
+	expect(legacy.body).toEqual("");
+	service.saveInstructions(scope, { permanent: { ...legacy, body: "New global instruction" } });
+	expect(service.listInstructionEntries(excludedScope).map(({ body }) => body)).toEqual([
+		"New global instruction",
+	]);
+	expect(service.listInstructionEntries(scope).map(({ body }) => body)).toEqual([
+		"New global instruction",
+		"Original global instruction",
+	]);
+});
+
 test("keeps comment files attached to their comment through retries and restart", () => {
 	const folder = mkdtempSync(join(tmpdir(), "session-task-comment-"));
 	resources.push(() => rmSync(folder, { recursive: true, force: true }));
