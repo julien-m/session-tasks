@@ -1,6 +1,6 @@
 {
 	"name": "session-tasks",
-	"version": "0.5.11",
+	"version": "0.5.12",
 	"description": "A persistent per-chat task queue for Codex Desktop",
 	"scripts": {
 		"typecheck": "tsc --noEmit",
@@ -22,6 +22,7 @@
 		"@modelcontextprotocol/ext-apps": "2.0.3",
 		"@modelcontextprotocol/node": "2.1.2",
 		"@modelcontextprotocol/server": "2.4.0",
+		"markdown-it": "15.0.3",
 		"zod": "4.6.7"
 	},
 	"devDependencies": {

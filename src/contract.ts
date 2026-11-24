@@ -31,6 +31,23 @@ export const state = z.enum(["queued", "running", "blocked", "done", "cancelled"
 export const actor = z.enum(["agent", "user"]);
 export const boardFilter = z.enum(["all", "remaining", "blocked", "done", "cancelled"]);
 export type BoardFilter = z.infer<typeof boardFilter>;
+export const MAX_BOARD_INSTRUCTIONS_BYTES = 4096;
+export const boardInstructionsBody = textBytes(MAX_BOARD_INSTRUCTIONS_BYTES);
+const instructionDocument = z.object({
+	revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+	body: boardInstructionsBody,
+});
+export const instructionChanges = z
+	.object({
+		chat: instructionDocument.optional(),
+		permanent: instructionDocument.optional(),
+	})
+	.strict();
+export type InstructionChanges = z.infer<typeof instructionChanges>;
+export interface BoardInstructions {
+	chat: z.infer<typeof instructionDocument>;
+	permanent: z.infer<typeof instructionDocument>;
+}
 export const commentBody = textBytes(8192).refine((value) => value.trim().length > 0);
 export const manualCheck = textBytes(1200).refine((value) => value.trim().length > 0);
 export const receipt = textBytes(8192).refine((value) => value.trim().length > 0);
@@ -102,6 +119,14 @@ export interface Revision {
 	createdAt: number;
 	attachments: Attachment[];
 }
+
+export const reformulation = z
+	.object({
+		title: taskInput.shape.title.refine((value) => !/[\r\n]/u.test(value)),
+		body: textBytes(MAX_TASK_BODY_BYTES).refine((value) => value.trim().length > 0),
+	})
+	.strict();
+export type Reformulation = z.infer<typeof reformulation>;
 
 export interface Task extends Revision {
 	id: string;

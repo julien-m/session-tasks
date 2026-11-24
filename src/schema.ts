@@ -4,6 +4,16 @@ CREATE TABLE IF NOT EXISTS board (
   thread_id TEXT NOT NULL PRIMARY KEY CHECK(length(CAST(thread_id AS BLOB)) BETWEEN 1 AND 256),
   scope TEXT NOT NULL UNIQUE CHECK(length(scope)=36)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS board_instructions (
+  scope TEXT NOT NULL PRIMARY KEY REFERENCES board(scope),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) <= 4096)
+) STRICT;
+CREATE TABLE IF NOT EXISTS permanent_instructions (
+  singleton INTEGER NOT NULL PRIMARY KEY CHECK(singleton=1),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) <= 4096)
+) STRICT;
 CREATE TABLE IF NOT EXISTS board_resume_signal (
   scope TEXT NOT NULL REFERENCES board(scope),
   code_hash TEXT NOT NULL CHECK(length(code_hash)=64 AND code_hash NOT GLOB '*[^0-9a-f]*'),
@@ -27,8 +37,18 @@ CREATE TABLE IF NOT EXISTS task (
   CHECK((state IN ('running','blocked','done')) = (assignee IS NOT NULL)),
   CHECK((state IN ('blocked','done')) = (receipt IS NOT NULL))
 ) STRICT;
-CREATE INDEX IF NOT EXISTS task_scope_order ON task(scope,ordinal);
+CREATE UNIQUE INDEX IF NOT EXISTS task_scope_ordinal ON task(scope,ordinal);
 CREATE INDEX IF NOT EXISTS task_scope_state ON task(scope,state,ordinal);
+-- An override permutes existing task ordinals in the same board. The ordinal
+-- stays the task identity and the assigned position survives state changes.
+CREATE TABLE IF NOT EXISTS task_order (
+  scope TEXT NOT NULL,
+  task_ordinal INTEGER NOT NULL PRIMARY KEY,
+  position INTEGER NOT NULL UNIQUE,
+  FOREIGN KEY(scope,task_ordinal) REFERENCES task(scope,ordinal),
+  FOREIGN KEY(scope,position) REFERENCES task(scope,ordinal),
+  CHECK(task_ordinal != position)
+) STRICT;
 CREATE TABLE IF NOT EXISTS task_validation (
   task_id TEXT NOT NULL REFERENCES task(id),
   serial INTEGER NOT NULL CHECK(serial BETWEEN 1 AND 9007199254740991),
@@ -57,6 +77,14 @@ CREATE TABLE IF NOT EXISTS task_title_split (
   revision INTEGER NOT NULL CHECK(revision=1),
   PRIMARY KEY(task_id,revision),
   FOREIGN KEY(task_id,revision) REFERENCES task_generated_title(task_id,revision)
+) STRICT;
+CREATE TABLE IF NOT EXISTS task_reformulation (
+  task_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  title TEXT NOT NULL CHECK(length(CAST(title AS BLOB)) BETWEEN 1 AND 240),
+  body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) BETWEEN 1 AND 32768),
+  PRIMARY KEY(task_id,revision),
+  FOREIGN KEY(task_id,revision) REFERENCES task_revision(task_id,revision)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS attachment (
   task_id TEXT NOT NULL REFERENCES task(id),

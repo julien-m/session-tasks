@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
 import { taskInput } from "../src/contract.ts";
+import { taskHook } from "../src/hook.ts";
 import { openDatabase, TaskRepository } from "../src/repository.ts";
 import { TaskService } from "../src/task-service.ts";
 
@@ -316,4 +317,141 @@ test("keeps attributed, scoped comments independent of task status and revisions
 	expect(service.list(scope, 0, "all").tasks.map(({ id }) => id)).toEqual([task.id]);
 	expect(service.list(scope).tasks).toHaveLength(0);
 	expect(service.comments(scope, task.id).comments).toEqual([first, second]);
+});
+
+test("persists queued drag order across restart and keeps task identities, other states and boards intact", () => {
+	const folder = mkdtempSync(join(tmpdir(), "session-task-order-"));
+	resources.push(() => rmSync(folder, { recursive: true, force: true }));
+	const path = join(folder, "tasks.sqlite3");
+	const { service, scope, database } = harness(path);
+	const otherScope = service.bind(randomUUID());
+	const add = (label: string, board = scope) =>
+		service.create(board, randomUUID(), taskInput.parse({ title: label }), "user");
+	const first = add("First");
+	const done = add("Done");
+	service.validate({ scope, taskId: done.id, expectedSerial: done.serial }, "Checked the fixture.");
+	const second = add("Second");
+	const third = add("Third");
+	const foreign = add("Other board", otherScope);
+	expect(() =>
+		database
+			.prepare("INSERT INTO task_order (scope,task_ordinal,position) VALUES (?,?,?)")
+			.run(scope, first.ordinal, foreign.ordinal),
+	).toThrow(/foreign key/i);
+	const down = {
+		scope,
+		taskId: first.id,
+		targetId: third.id,
+		position: first.ordinal,
+		targetPosition: third.ordinal,
+	};
+	service.moveQueued(down);
+	expect(service.list(scope).tasks.map(({ id }) => id)).toEqual([second.id, done.id, third.id, first.id]);
+	expect(service.list(scope, done.ordinal).tasks.map(({ id }) => id)).toEqual([third.id, first.id]);
+	expect(service.get(scope, first.id)).toEqual(first);
+	expect(() => service.moveQueued(down)).toThrow("conflict");
+	expect(() =>
+		service.moveQueued({ ...down, targetId: foreign.id, targetPosition: foreign.ordinal }),
+	).toThrow("conflict");
+	expect(() =>
+		service.moveQueued({ ...down, position: third.ordinal, targetId: done.id, targetPosition: done.ordinal }),
+	).toThrow("conflict");
+
+	const restarted = harness(path).service;
+	expect(restarted.list(scope).tasks.map(({ id }) => id)).toEqual([second.id, done.id, third.id, first.id]);
+	expect(restarted.list(otherScope).tasks.map(({ id }) => id)).toEqual([foreign.id]);
+	restarted.moveQueued({
+		scope,
+		taskId: first.id,
+		targetId: second.id,
+		position: third.ordinal,
+		targetPosition: first.ordinal,
+	});
+	expect(restarted.list(scope).tasks.map(({ id }) => id)).toEqual([first.id, done.id, second.id, third.id]);
+});
+
+test("shows a generated title and Markdown for the current revision while retaining the input and claim", () => {
+	const { service, scope } = harness();
+	const input = taskInput.parse({ title: "Verify report", body: "  const expected = 1;\n" });
+	const task = service.create(scope, randomUUID(), input, "user");
+	const generated = {
+		title: "Verify the report",
+		body: "**Check** the comparison.\n\n```js\n  const expected = 1;\n```",
+	};
+	const { task: running } = service.claim({
+		scope,
+		taskId: task.id,
+		expectedSerial: task.serial,
+		assignee: "thread",
+	});
+	service.saveReformulation(scope, task.id, task.revision, generated);
+	expect(service.get(scope, task.id)).toEqual(running);
+	expect(service.readReformulation(running)).toEqual(generated);
+	expect(service.list(scope, 0, false, true).tasks[0]?.title).toBe(generated.title);
+	expect(service.list(scope).tasks[0]?.title).toBe(input.title);
+	expect(service.history(scope, task.id)[0]?.body).toBe(input.body);
+	const revised = service.edit(
+		{ scope, taskId: task.id, expectedRevision: task.revision },
+		{ ...input, body: "The actual next instruction" },
+		"user",
+	);
+	service.saveReformulation(scope, task.id, task.revision, { ...generated, title: "Stale suggestion" });
+	expect(service.readReformulation(revised)).toBeUndefined();
+	expect(service.list(scope, 0, false, true).tasks[0]?.title).toBe(input.title);
+	service.saveReformulation(scope, task.id, revised.revision, generated);
+	expect(service.readReformulation(revised)).toEqual(generated);
+});
+
+test("keeps recurring instructions scoped and requests them on every prompt without making them tasks", () => {
+	const { service, scope } = harness();
+	const thread = randomUUID();
+	const another = service.bind(thread);
+	const prompt = { hook_event_name: "UserPromptSubmit", session_id: thread, prompt: "Bonjour" };
+	expect(JSON.stringify(taskHook(service, prompt))).not.toContain("Read session_tasks_instructions");
+	const body = "- Run the tests after a change.\n- Report the result.";
+	expect(service.saveInstructions(another, { chat: { revision: 0, body } }).chat).toEqual({
+		revision: 1,
+		body,
+	});
+	expect(service.readInstructions(scope).chat).toEqual({ revision: 0, body: "" });
+	expect(service.list(another).tasks).toEqual([]);
+	expect(() => service.saveInstructions(another, { chat: { revision: 0, body: "Outdated change" } })).toThrow(
+		"conflict",
+	);
+
+	for (const request of [prompt, { ...prompt, prompt: "Nouvelle demande" }]) {
+		const context = JSON.stringify(taskHook(service, request));
+		expect(context).toContain("Read session_tasks_instructions");
+		expect(context).toContain("Follow the order returned by session_tasks_list");
+		expect(context).not.toContain("Run the tests after a change");
+	}
+	expect(taskHook(service, { ...prompt, hook_event_name: "Stop" })).toEqual({});
+	expect(service.saveInstructions(another, { chat: { revision: 1, body: " " } }).chat).toEqual({
+		revision: 2,
+		body: "",
+	});
+	expect(JSON.stringify(taskHook(service, prompt))).toContain("Discard Session Tasks instruction lists");
+	const permanent = { revision: 0, body: "- Summarize verification." };
+	service.saveInstructions(scope, { permanent });
+	expect(service.readInstructions(another).permanent).toEqual({ ...permanent, revision: 1 });
+	expect(JSON.stringify(taskHook(service, prompt))).toContain("Read session_tasks_instructions");
+	expect(() =>
+		service.saveInstructions(another, { chat: { revision: 2, body }, permanent: { ...permanent, body: "" } }),
+	).toThrow("conflict");
+	expect(service.readInstructions(another).chat).toEqual({ revision: 2, body: "" });
+});
+
+test("keeps reformulation through metadata edits, even if generation completes after the edit", () => {
+	const { service, scope } = harness();
+	const input = taskInput.parse({ title: "Inspect report", body: "Keep the original scope." });
+	const task = service.create(scope, randomUUID(), input, "user");
+	const generated = { title: "Inspect the report", body: "**Inspect** the original scope." };
+	const changeMode = (revision: number, mode: "thread" | "auto") =>
+		service.edit({ scope, taskId: task.id, expectedRevision: revision }, { ...input, mode }, "user");
+	const during = changeMode(task.revision, "thread");
+	service.saveReformulation(scope, task.id, task.revision, generated);
+	expect(service.readReformulation(during)).toEqual(generated);
+	const after = changeMode(during.revision, "auto");
+	expect(service.readReformulation(after)).toEqual(generated);
+	expect(service.get(scope, task.id).body).toBe(input.body);
 });

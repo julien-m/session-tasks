@@ -8,9 +8,12 @@ import {
 	type Actor,
 	type Attachment,
 	type BoardFilter,
+	type BoardInstructions,
+	type InstructionChanges,
 	MAX_PAGE,
 	type Mode,
 	manualCheck,
+	type Reformulation,
 	type Revision,
 	type State,
 	type Task,
@@ -91,12 +94,15 @@ export interface StoredFile {
 	data: Uint8Array;
 }
 export interface BoardList {
-	tasks: TaskSummary[];
+	tasks: Array<TaskSummary & { position: number }>;
 	counts: Record<State, number>;
 	next: number | null;
 }
 const currentContent = `FROM task t JOIN task_revision r ON r.task_id=t.id AND r.revision=t.revision
 LEFT JOIN task_generated_title g ON g.task_id=r.task_id AND g.revision=r.revision`;
+const orderJoin =
+	"LEFT JOIN task_order ordering ON ordering.scope=t.scope AND ordering.task_ordinal=t.ordinal";
+const position = "COALESCE(ordering.position,t.ordinal)";
 const SELECT_TASK = `SELECT t.*, COALESCE(g.title,r.title) title,
 CASE WHEN split.task_id IS NOT NULL THEN r.title ELSE r.body END body,
 r.mode, r.author, r.created_at
@@ -143,6 +149,56 @@ export class TaskRepository {
 	/** Verifies that a request names an existing board capability. */
 	assertScope(scope: string): void {
 		this.threadForScope(scope);
+	}
+
+	readInstructions(scope: string): BoardInstructions {
+		const row = this.database
+			.prepare(`SELECT COALESCE(c.revision,0) chatRevision, COALESCE(c.body,'') chatBody,
+				COALESCE(p.revision,0) permanentRevision, COALESCE(p.body,'') permanentBody
+			FROM board b
+			LEFT JOIN board_instructions c ON c.scope=b.scope
+			LEFT JOIN permanent_instructions p ON p.singleton=1
+			WHERE b.scope=?`)
+			.get(scope) as
+			| {
+					chatRevision: number;
+					chatBody: string;
+					permanentRevision: number;
+					permanentBody: string;
+			  }
+			| undefined;
+		if (!row) throw new TaskError("invalid_scope");
+		return {
+			chat: { revision: row.chatRevision, body: row.chatBody },
+			permanent: { revision: row.permanentRevision, body: row.permanentBody },
+		};
+	}
+
+	saveInstructions(scope: string, changes: InstructionChanges): BoardInstructions {
+		return this.write(() => {
+			const current = this.readInstructions(scope);
+			for (const mode of ["chat", "permanent"] as const) {
+				const change = changes[mode];
+				if (!change) continue;
+				if (change.revision !== current[mode].revision) throw new TaskError("conflict");
+				const body = change.body.trim() ? change.body : "";
+				if (body === current[mode].body) continue;
+				const revision = change.revision + 1;
+				if (mode === "chat") {
+					this.database
+						.prepare(`INSERT INTO board_instructions(scope,revision,body) VALUES (?,?,?)
+						ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,body=excluded.body`)
+						.run(scope, revision, body);
+				} else {
+					this.database
+						.prepare(`INSERT INTO permanent_instructions(singleton,revision,body) VALUES (1,?,?)
+						ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,body=excluded.body`)
+						.run(revision, body);
+				}
+				current[mode] = { revision, body };
+			}
+			return current;
+		});
 	}
 
 	requestResume(scope: string, codeHash: string, now: number, expiresAt: number): boolean {
@@ -229,6 +285,25 @@ export class TaskRepository {
 		});
 	}
 
+	/** Stores a fitted presentation for the current revision without changing its instructions. */
+	saveReformulation(scope: string, taskId: string, revision: number, generated: Reformulation): void {
+		this.database
+			.prepare(`INSERT INTO task_reformulation(task_id,revision,title,body)
+				SELECT t.id,t.revision,?,? FROM task t
+				JOIN task_revision source ON source.task_id=t.id AND source.revision=?
+				JOIN task_revision current ON current.task_id=t.id AND current.revision=t.revision
+				WHERE t.scope=? AND t.id=? AND t.state!='cancelled'
+				  AND current.title=source.title AND current.body=source.body
+				ON CONFLICT(task_id,revision) DO NOTHING`)
+			.run(generated.title, generated.body, revision, scope, taskId);
+	}
+
+	readReformulation(taskId: string, revision: number): Reformulation | undefined {
+		return this.database
+			.prepare("SELECT title,body FROM task_reformulation WHERE task_id=? AND revision=?")
+			.get(taskId, revision) as unknown as Reformulation | undefined;
+	}
+
 	/** Advances the current snapshot and operational state of a task. */
 	update(
 		scope: string,
@@ -308,8 +383,55 @@ export class TaskRepository {
 		this.database.prepare("INSERT INTO task_validation VALUES (?,?,?)").run(taskId, serial, observation);
 	}
 
+	/** Permutes the queued slots in a range without modifying the task snapshots. */
+	moveQueued(scope: string, source: number, target: number): void {
+		const items = this.database
+			.prepare(`SELECT t.ordinal,${position} AS position
+				FROM task t ${orderJoin}
+				WHERE t.scope=? AND t.state='queued' AND ${position} BETWEEN ? AND ?
+				ORDER BY position`)
+			.all(scope, Math.min(source, target), Math.max(source, target)) as unknown as Array<{
+			ordinal: number;
+			position: number;
+		}>;
+		if (
+			items.length < 2 ||
+			items[0]?.position !== Math.min(source, target) ||
+			items.at(-1)?.position !== Math.max(source, target)
+		)
+			throw new TaskError("conflict");
+		const ordinals = items.map((item) => item.ordinal);
+		const from = source < target ? ordinals.shift() : ordinals.pop();
+		if (from === undefined) throw new TaskError("conflict");
+		if (source < target) ordinals.push(from);
+		else ordinals.unshift(from);
+
+		const remove = this.database.prepare("DELETE FROM task_order WHERE scope=? AND task_ordinal=?");
+		const assign = this.database.prepare(
+			"INSERT INTO task_order (scope,task_ordinal,position) VALUES (?,?,?)",
+		);
+		for (const ordinal of ordinals) remove.run(scope, ordinal);
+		for (const [index, item] of items.entries()) {
+			const ordinal = ordinals[index];
+			if (ordinal !== undefined && ordinal !== item.position) assign.run(scope, ordinal, item.position);
+		}
+	}
+
+	queuedPosition(scope: string, taskId: string): number | undefined {
+		const row = this.database
+			.prepare(`SELECT ${position} position FROM task t ${orderJoin}
+			WHERE t.scope=? AND t.id=? AND t.state='queued'`)
+			.get(scope, taskId);
+		return row?.position as number | undefined;
+	}
+
 	/** Reads a keyset page and per-board state counts. */
-	list(scope: string, after: number, filter: BoardFilter | "active" | BoardFilter[]): BoardList {
+	list(
+		scope: string,
+		after: number,
+		filter: BoardFilter | "active" | BoardFilter[],
+		formatted = false,
+	): BoardList {
 		const condition = Array.isArray(filter)
 			? filter.length
 				? filter
@@ -318,19 +440,21 @@ export class TaskRepository {
 				: stateFilters.all
 			: stateFilters[filter];
 		const rows = this.database
-			.prepare(`SELECT t.id,t.ordinal,t.serial,t.revision,COALESCE(g.title,r.title) title,r.mode,t.state,t.assignee,
+			.prepare(`SELECT t.id,t.ordinal,${position} position,t.serial,t.revision,COALESCE(${formatted ? "f.title," : ""}g.title,r.title) title,r.mode,t.state,t.assignee,
 			CASE WHEN t.state='blocked' THEN substr(t.receipt,1,160) END blockedReason,
 			(SELECT count(*) FROM revision_attachment a WHERE a.task_id=t.id AND a.revision=t.revision) attachmentCount
 			${currentContent}
-			WHERE t.scope=? AND t.ordinal>? AND (${condition}) ORDER BY t.ordinal LIMIT ?`)
-			.all(scope, after, MAX_PAGE + 1) as unknown as TaskSummary[];
+			${orderJoin}
+			${formatted ? "LEFT JOIN task_reformulation f ON f.task_id=r.task_id AND f.revision=r.revision" : ""}
+			WHERE t.scope=? AND ${position}>? AND (${condition}) ORDER BY position LIMIT ?`)
+			.all(scope, after, MAX_PAGE + 1) as unknown as BoardList["tasks"];
 		const counts: Record<State, number> = { queued: 0, running: 0, blocked: 0, done: 0, cancelled: 0 };
 		for (const row of this.database
 			.prepare("SELECT state,count(*) count FROM task WHERE scope=? GROUP BY state")
 			.all(scope))
 			counts[row.state as State] = Number(row.count);
 		const tasks = rows.slice(0, MAX_PAGE);
-		return { tasks, counts, next: rows.length > MAX_PAGE ? (tasks.at(-1)?.ordinal ?? null) : null };
+		return { tasks, counts, next: rows.length > MAX_PAGE ? (tasks.at(-1)?.position ?? null) : null };
 	}
 
 	addComment(

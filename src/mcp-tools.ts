@@ -13,16 +13,24 @@ import {
 	boardFilter,
 	commentBody,
 	id,
+	instructionChanges,
 	manualCheck,
 	receipt,
 	resumeCode,
 	serial,
+	type Task,
 	TaskError,
 	taskInput,
 	verification,
 } from "./contract.ts";
 import type { TaskService } from "./task-service.ts";
-import { isTitlePending, scheduleTaskTitle, suggestTitle } from "./title-suggestion.ts";
+import {
+	isReformulationPending,
+	isTitlePending,
+	scheduleReformulation,
+	scheduleTaskTitle,
+	suggestTitle,
+} from "./title-suggestion.ts";
 
 const UI_URI = "ui://session-tasks/tasks.html";
 const icon = readFileSync(new URL("../assets/session-tasks.png", import.meta.url), "base64");
@@ -36,6 +44,7 @@ const list = scoped.extend({
 	after: z.number().int().nonnegative().default(0),
 	cancelled: z.boolean().default(false),
 });
+const move = identified.extend({ targetId: id, position: serial, targetPosition: serial });
 const attachment = identified.extend({ attachmentId: id });
 const comment = identified.extend({ commentId: id, body: commentBody });
 const comments = identified.extend({ before: serial.optional() });
@@ -102,6 +111,17 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		);
 	};
 
+	const queueReformulation = (scope: string, task: Task, locale: "en" | "fr") => {
+		scheduleReformulation(task, locale, (generated) =>
+			service.saveReformulation(scope, task.id, task.revision, generated),
+		);
+	};
+	const panelTask = (task: Task) => ({
+		...task,
+		reformulation: service.readReformulation(task),
+		reformulationPending: isReformulationPending(task.id, task.revision),
+	});
+
 	const openTool = {
 		title: "Session Tasks",
 		description:
@@ -146,16 +166,19 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 			return result(
 				{
 					...page,
-					tasks: page.tasks.map(({ id, ordinal, title, serial, revision, state, mode, assignee }) => ({
-						id,
-						ordinal,
-						title,
-						serial,
-						revision,
-						state,
-						mode,
-						assignee,
-					})),
+					tasks: page.tasks.map(
+						({ id, ordinal, position, title, serial, revision, state, mode, assignee }) => ({
+							id,
+							ordinal,
+							position,
+							title,
+							serial,
+							revision,
+							state,
+							mode,
+							assignee,
+						}),
+					),
 				},
 				true,
 			);
@@ -167,6 +190,23 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		identified,
 		true,
 		({ scope, taskId }) => result(service.get(scope, taskId), true),
+	);
+	agent(
+		"session_tasks_instructions",
+		"Read the user's saved instructions for all chats and this exact chat. The current chat can refine general preferences. Apply both subject to higher-priority instructions and the user's latest explicit request.",
+		scoped,
+		true,
+		({ scope }) => result(service.readInstructions(scope), true),
+	);
+	agent(
+		"session_tasks_move",
+		"Move a queued task to another queued task's position to respect a user priority or a concrete prerequisite. Use the exact current positions from session_tasks_list. Moving upward inserts before the target, and moving downward inserts after it. Record the concrete reason on the affected task.",
+		move,
+		false,
+		(command) => {
+			service.moveQueued(command);
+			return result({ moved: true }, true);
+		},
 	);
 	agent(
 		"session_tasks_edit",
@@ -254,18 +294,31 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		list.extend({ filter: boardFilter.optional(), filters: z.array(boardFilter).max(5).optional() }),
 		true,
 		({ scope, after, cancelled, filter, filters }) => {
-			const page = service.list(scope, after, filters ?? filter ?? cancelled);
+			const page = service.list(scope, after, filters ?? filter ?? cancelled, true);
 			return {
 				...page,
 				tasks: page.tasks.map((task) =>
-					task.revision === 1 && task.state !== "cancelled" && isTitlePending(task.id)
+					task.state !== "cancelled" &&
+					(isReformulationPending(task.id, task.revision) || (task.revision === 1 && isTitlePending(task.id)))
 						? { ...task, titlePending: true }
 						: task,
 				),
 			};
 		},
 	);
-	panel("task_panel_get", identified, true, ({ scope, taskId }) => service.get(scope, taskId));
+	panel("task_panel_get", identified, true, ({ scope, taskId }) => panelTask(service.get(scope, taskId)));
+	panel("task_panel_instructions", scoped, true, ({ scope }) => service.readInstructions(scope));
+	panel(
+		"task_panel_save_instructions",
+		scoped.extend({ changes: instructionChanges }),
+		false,
+		({ scope, changes }) => service.saveInstructions(scope, changes),
+	);
+
+	panel("task_panel_move", move, false, (command) => {
+		service.moveQueued(command);
+		return { moved: true };
+	});
 	panel("task_panel_request_resume", scoped, false, ({ scope }) => {
 		const code = service.requestResume(scope);
 		return code ? { requested: true, code } : { requested: false };
@@ -287,15 +340,17 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 		create.extend({
 			generateTitle: z.enum(["en", "fr"]).optional(),
 			splitTitle: z.enum(["en", "fr"]).optional(),
+			reformulate: z.enum(["en", "fr"]).optional(),
 		}),
 		false,
-		async ({ scope, taskId, input, generateTitle, splitTitle }) => {
+		async ({ scope, taskId, input, generateTitle, splitTitle, reformulate }) => {
 			const { task, created, wakeThreadId } = service.createFromPanel(scope, taskId, input);
 			const locale = splitTitle ?? generateTitle;
 			const source =
 				input.body.trim() || (splitTitle ? input.title : input.files.map((file) => file.name).join("\n"));
 			const split = Boolean(splitTitle && !input.body.trim());
-			if (created && locale && source)
+			if (created && reformulate) queueReformulation(scope, task, reformulate);
+			else if (created && locale && source)
 				scheduleTaskTitle(
 					taskId,
 					source.slice(0, 1600),
@@ -319,10 +374,15 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 			preserveTitle: z.boolean().default(false),
 			preserveBody: z.boolean().default(false),
 			appendBody: taskInput.shape.body,
+			reformulate: z.enum(["en", "fr"]).optional(),
 		}),
 		false,
-		({ input, preserveTitle, preserveBody, appendBody, ...command }) =>
-			service.edit(command, input, "user", { preserveTitle, preserveBody, appendBody }),
+		({ input, preserveTitle, preserveBody, appendBody, reformulate, ...command }) => {
+			const task = service.edit(command, input, "user", { preserveTitle, preserveBody, appendBody });
+			if (reformulate && task.revision !== command.expectedRevision)
+				queueReformulation(command.scope, task, reformulate);
+			return panelTask(task);
+		},
 	);
 	panel("task_panel_cancel", versioned, false, (command) => service.cancel(command));
 	panel("task_panel_restore", versioned, false, (command) => service.requeue(command));
@@ -335,9 +395,14 @@ export function createTaskMcp(service: TaskService, html: string, version: strin
 	panel("task_panel_comment", comment, false, ({ scope, taskId, commentId, body }) =>
 		service.comment(scope, taskId, commentId, body, "user"),
 	);
-	panel("task_panel_comments", comments, true, ({ scope, taskId, before }) =>
-		service.comments(scope, taskId, before),
-	);
+	panel("task_panel_comments", comments, true, ({ scope, taskId, before }) => {
+		const task = service.get(scope, taskId);
+		return {
+			...service.comments(scope, taskId, before),
+			reformulationPending: isReformulationPending(task.id, task.revision),
+			hasReformulation: Boolean(service.readReformulation(task)),
+		};
+	});
 	panel(
 		"task_panel_history",
 		identified.extend({ before: serial.optional() }),

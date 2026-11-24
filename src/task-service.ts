@@ -4,11 +4,16 @@ import {
 	type Actor,
 	appendContextText,
 	type BoardFilter,
+	type BoardInstructions,
 	commentBody,
+	type InstructionChanges,
+	instructionChanges,
 	MAX_FILE_BYTES,
 	MAX_UPLOAD_BYTES,
 	manualCheck,
+	type Reformulation,
 	type Revision,
+	reformulation,
 	resumeCode,
 	type Task,
 	type TaskComment,
@@ -84,10 +89,41 @@ export class TaskService {
 	}
 
 	/** Lists the current board without fetching any attachment bytes. */
-	list(scope: string, after = 0, cancelled: boolean | BoardFilter | BoardFilter[] = false): BoardList {
+	list(
+		scope: string,
+		after = 0,
+		cancelled: boolean | BoardFilter | BoardFilter[] = false,
+		formatted = false,
+	): BoardList {
 		this.store.assertScope(scope);
 		const filter = typeof cancelled === "boolean" ? (cancelled ? "cancelled" : "active") : cancelled;
-		return this.store.list(scope, after, filter);
+		return this.store.list(scope, after, filter, formatted);
+	}
+
+	readInstructions(scope: string): BoardInstructions {
+		return this.store.readInstructions(scope);
+	}
+
+	saveInstructions(scope: string, changes: InstructionChanges): BoardInstructions {
+		const checked = instructionChanges.safeParse(changes);
+		if (!checked.success) throw new TaskError("invalid_context");
+		return this.store.saveInstructions(scope, checked.data);
+	}
+
+	moveQueued(command: {
+		scope: string;
+		taskId: string;
+		targetId: string;
+		position: number;
+		targetPosition: number;
+	}): void {
+		this.store.write(() => {
+			const source = this.store.queuedPosition(command.scope, command.taskId);
+			const target = this.store.queuedPosition(command.scope, command.targetId);
+			if (source !== command.position || target !== command.targetPosition || source === target)
+				throw new TaskError("conflict");
+			this.store.moveQueued(command.scope, source, target);
+		});
 	}
 
 	resumeOwner(scope: string, taskId: string): string | undefined {
@@ -109,7 +145,7 @@ export class TaskService {
 
 	/** Records an explicit human check on the current task without an agent claim. */
 	validate(command: VersionedTask, observation: string): Task {
-		const checked = manualCheck.safeParse(observation.trim());
+		const checked = manualCheck.safeParse(observation);
 		if (!checked.success) throw new TaskError("verification_required");
 		return this.mutate(command, (row) => {
 			if (row.state === "done") {
@@ -149,7 +185,7 @@ export class TaskService {
 	comment(scope: string, taskId: string, commentId: string, body: string, author: Actor): TaskComment {
 		return this.store.write(() => {
 			this.requireTask(scope, taskId);
-			const parsed = commentBody.safeParse(body.trim());
+			const parsed = commentBody.safeParse(body);
 			if (!parsed.success) throw new TaskError("invalid_state");
 			return this.store.addComment(taskId, commentId, author, "comment", parsed.data, this.now());
 		});
@@ -182,6 +218,15 @@ export class TaskService {
 	/** Allows a wake only for the first addition to a drained board. */
 	createFromPanel(scope: string, taskId: string, input: TaskInput): TaskCreation {
 		return this.insert(scope, taskId, input, "user", true);
+	}
+
+	saveReformulation(scope: string, taskId: string, revision: number, generated: Reformulation): void {
+		const checked = reformulation.safeParse(generated);
+		if (checked.success) this.store.saveReformulation(scope, taskId, revision, checked.data);
+	}
+
+	readReformulation(task: Task): Reformulation | undefined {
+		return this.store.readReformulation(task.id, task.revision);
 	}
 
 	saveGeneratedTitle(scope: string, taskId: string, title: string, split = false): void {
@@ -247,6 +292,10 @@ export class TaskService {
 			const now = this.now();
 			this.saveRevision(row.id, row.revision + 1, { ...input, title, body }, author, now, files);
 			this.store.update(command.scope, row.id, row, inactive("queued"), now, row.revision + 1);
+			if (title === row.title && body === row.body) {
+				const formatted = this.store.readReformulation(row.id, row.revision);
+				if (formatted) this.store.saveReformulation(command.scope, row.id, row.revision, formatted);
+			}
 			return this.get(command.scope, row.id);
 		});
 	}

@@ -19,12 +19,17 @@ import {
 	type Attachment,
 	appendContextText,
 	type BoardFilter,
+	type BoardInstructions,
 	byteLength,
 	commentBody,
+	type InstructionChanges,
 	id,
+	instructionChanges,
+	MAX_BOARD_INSTRUCTIONS_BYTES,
 	MAX_PAGE,
 	MAX_TASK_BODY_BYTES,
 	manualCheck,
+	type Reformulation,
 	type Revision,
 	resumeCodePrefix,
 	type Task,
@@ -32,6 +37,7 @@ import {
 	type TaskSummary,
 	taskInput,
 } from "./contract.ts";
+import { renderMarkdown } from "./markdown-view.ts";
 import { catalog } from "./messages.ts";
 import type { BoardList, CommentsPage } from "./repository.ts";
 
@@ -75,6 +81,56 @@ function field(caption: string, control: HTMLElement): HTMLLabelElement {
 	const label = element("label", undefined, "field");
 	label.append(element("span", caption), control);
 	return label;
+}
+
+function updateMarkdown(content: HTMLElement, source: string): void {
+	renderMarkdown(content, source, (url) => {
+		void app.openLink({ url }).catch(() => {});
+	});
+}
+
+function markdownBlock(source: string, className = "markdown-content"): HTMLDivElement {
+	const content = element("div", undefined, className);
+	updateMarkdown(content, source);
+	return content;
+}
+
+function markdownEditor(caption: string, textarea: HTMLTextAreaElement, initialPreview = false) {
+	const wrapper = element("div", undefined, "markdown-editor");
+	const preview = element("div", undefined, "markdown-content markdown-preview");
+	preview.setAttribute("role", "region");
+	preview.setAttribute("aria-label", t.markdownPreview);
+	const source = button(t.markdownText, () => setPreview(false));
+	const rendered = button(t.markdownPreview, () => setPreview(true));
+	const controls = group(source, rendered);
+	controls.classList.add("markdown-controls");
+	controls.setAttribute("role", "group");
+	controls.setAttribute("aria-label", caption);
+	const label = element("label", caption);
+	textarea.id = `markdown-source-${newTaskId()}`;
+	label.htmlFor = textarea.id;
+	const toolbar = group(label, controls);
+	toolbar.classList.add("markdown-toolbar");
+	wrapper.append(toolbar, textarea, preview);
+
+	const refresh = () => {
+		if (!preview.hidden) {
+			updateMarkdown(preview, textarea.value);
+			if (!preview.hasChildNodes()) preview.textContent = t.markdownEmpty;
+		}
+	};
+
+	function setPreview(enabled: boolean): void {
+		source.setAttribute("aria-pressed", String(!enabled));
+		rendered.setAttribute("aria-pressed", String(enabled));
+		textarea.hidden = enabled;
+		preview.hidden = !enabled;
+		refresh();
+	}
+
+	textarea.addEventListener("invalid", () => setPreview(false));
+	setPreview(initialPreview);
+	return { wrapper, refresh, setPreview, isPreview: () => !preview.hidden };
 }
 
 let scope: string | undefined;
@@ -176,7 +232,7 @@ quickAdd.onsubmit = async (event) => {
 	mutation = true;
 	quickSubmit.disabled = true;
 	try {
-		const saved = await createTask({ taskId, input, splitTitle: locale });
+		const saved = await createTask({ taskId, input, reformulate: locale });
 		quickPending = undefined;
 		if (scope !== board) return;
 		if (quickTitle.value === draft) quickTitle.value = "";
@@ -233,7 +289,9 @@ const pageNavigation = group(previous, more);
 const filterBar = group(filters, cancelledFilter, resume);
 filterBar.classList.add("board-filters");
 const boardHeader = element("header", undefined, "board-header");
-boardHeader.append(element("h1", t.heading));
+const instructionsButton = button(t.instructions, () => void showInstructions());
+instructionsButton.disabled = true;
+boardHeader.append(group(element("h1", t.heading), instructionsButton));
 const boardList = element("div", undefined, "board-list");
 boardList.append(transferNotice, notice, rows, dropZone);
 const addRow = element("div", undefined, "board-add");
@@ -255,7 +313,8 @@ let refreshDiscussion: (() => Promise<void>) | undefined;
 let next: number | null = null;
 let cursor = 0;
 const pageHistory: number[] = [];
-type PanelTask = TaskSummary & { titlePending?: boolean };
+type PanelTask = BoardList["tasks"][number] & { titlePending?: boolean };
+type PanelDetail = Task & { reformulation?: Reformulation; reformulationPending?: boolean };
 type PanelBoardList = Omit<BoardList, "tasks"> & { tasks: PanelTask[] };
 let current: PanelTask[] = [];
 let refreshGeneration = 0;
@@ -269,6 +328,29 @@ function finishMutation(): void {
 	if (nextTransfer) void nextTransfer();
 }
 let lastRender = "";
+let draggedTask: PanelTask | undefined;
+const reorderType = "application/x-session-tasks-order";
+
+function moveTask(source: PanelTask, target: PanelTask): void {
+	if (mutation || source.id === target.id || target.state !== "queued") return;
+	void (async () => {
+		mutation = true;
+		try {
+			await call("move", {
+				taskId: source.id,
+				targetId: target.id,
+				position: source.position,
+				targetPosition: target.position,
+			});
+			transferMessage(t.taskMoved);
+		} catch (error) {
+			transferMessage(error instanceof Error && error.message === "conflict" ? t.unsigned : t.error);
+		} finally {
+			void refresh(true);
+			finishMutation();
+		}
+	})();
+}
 
 function switchList(values: BoardFilter[]): Promise<void> {
 	selectedFilters = values;
@@ -341,7 +423,7 @@ async function revealCreatedTask(task: Task): Promise<void> {
 	await loading;
 	if (generation !== refreshGeneration || dialog.open) return;
 	const last = current.at(-1);
-	if (next !== null && last && last.ordinal < task.ordinal) {
+	if (next !== null && last && last.position < task.ordinal) {
 		pageHistory.push(cursor);
 		cursor = task.ordinal - 1;
 		await resetPage();
@@ -369,13 +451,18 @@ function render(counts: BoardList["counts"]): void {
 	const signature = JSON.stringify(
 		current.map(({ id, serial, title, titlePending }) => [id, serial, title, titlePending]),
 	);
-	if (signature === lastRender) return;
+	if (signature === lastRender || draggedTask) return;
 	lastRender = signature;
-	const focusedTask = rows.contains(document.activeElement) ? dropTaskId(document.activeElement) : undefined;
+	const active = document.activeElement;
+	const focusedTask = rows.contains(active) ? dropTaskId(active) : undefined;
+	const focusClass =
+		["reorder-handle", "row-edit", "task-marker", "task-title"].find((name) =>
+			active?.classList.contains(name),
+		) ?? "task-title";
 	rows.replaceChildren(...current.map(renderTask));
 	if (focusedTask)
 		rows
-			.querySelector<HTMLButtonElement>(`[data-task-id="${CSS.escape(focusedTask)}"] .task-title`)
+			.querySelector<HTMLButtonElement>(`[data-task-id="${CSS.escape(focusedTask)}"] .${focusClass}`)
 			?.focus({ preventScroll: true });
 }
 
@@ -403,6 +490,56 @@ function renderTask(task: PanelTask): HTMLLIElement {
 	const line = group(title);
 	line.classList.add("row-title");
 	if (task.state !== "cancelled") line.append(edit);
+	if (task.state === "queued" && current.filter((entry) => entry.state === "queued").length > 1) {
+		const grip = element("button", "⠿", "icon-button reorder-handle");
+		grip.type = "button";
+		grip.draggable = true;
+		grip.title = t.reorderTask;
+		grip.setAttribute("aria-label", `${t.reorderTask} · ${task.title}`);
+		grip.setAttribute("aria-keyshortcuts", "ArrowUp ArrowDown");
+		grip.ondragstart = (event) => {
+			if (mutation || !event.dataTransfer) {
+				event.preventDefault();
+				return;
+			}
+			draggedTask = task;
+			event.dataTransfer.effectAllowed = "move";
+			event.dataTransfer.setData(reorderType, task.id);
+			row.classList.add("reorder-source");
+		};
+		grip.ondragend = () => {
+			draggedTask = undefined;
+			row.classList.remove("reorder-source");
+			rows.querySelector(".reorder-target")?.classList.remove("reorder-target");
+		};
+		grip.onkeydown = (event) => {
+			if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+			event.preventDefault();
+			const queued = current.filter((entry) => entry.state === "queued");
+			const index = queued.findIndex((entry) => entry.id === task.id);
+			const target = queued[index + (event.key === "ArrowUp" ? -1 : 1)];
+			if (target) moveTask(task, target);
+		};
+		row.ondragover = (event) => {
+			if (!draggedTask || draggedTask.id === task.id || !event.dataTransfer?.types.includes(reorderType))
+				return;
+			event.preventDefault();
+			event.dataTransfer.dropEffect = "move";
+			row.classList.add("reorder-target");
+		};
+		row.ondragleave = (event) => {
+			if (!(event.relatedTarget instanceof Node) || !row.contains(event.relatedTarget))
+				row.classList.remove("reorder-target");
+		};
+		row.ondrop = (event) => {
+			row.classList.remove("reorder-target");
+			if (!draggedTask || event.dataTransfer?.getData(reorderType) !== draggedTask.id) return;
+			event.preventDefault();
+			event.stopPropagation();
+			moveTask(draggedTask, task);
+		};
+		line.append(grip);
+	}
 	summary.append(line);
 	const metadata = group(element("span", label, "task-state"));
 	metadata.classList.add("task-meta");
@@ -458,11 +595,74 @@ function dialogHeader(title: string, fullPane = false): void {
 	if (!dialog.open) dialog.showModal();
 }
 
+async function showInstructions(): Promise<void> {
+	dialogHeader(t.instructions);
+	const heading = dialogContent.querySelector("h2");
+	const loading = element("p", t.loading, "notice");
+	dialogContent.append(loading);
+	const board = scope;
+	try {
+		const current = await call<BoardInstructions>("instructions");
+		if (!dialog.open || !heading?.isConnected || scope !== board) return;
+		const form = element("form");
+		const chatInput = element("textarea");
+		const permanentInput = element("textarea");
+		chatInput.maxLength = permanentInput.maxLength = MAX_BOARD_INSTRUCTIONS_BYTES;
+		chatInput.value = current.chat.body;
+		permanentInput.value = current.permanent.body;
+		const chatEditor = markdownEditor(t.instructionsThisChat, chatInput);
+		const permanentEditor = markdownEditor(t.instructionsAllChats, permanentInput);
+		const save = taskSubmit(t.save, "primary");
+		const feedback = element("p", undefined, "notice");
+		feedback.setAttribute("role", "status");
+		form.append(
+			element("p", t.instructionsEveryTurn, "meta"),
+			chatEditor.wrapper,
+			permanentEditor.wrapper,
+			group(save),
+			feedback,
+		);
+		loading.replaceWith(form);
+		chatInput.focus();
+		form.onsubmit = async (event) => {
+			event.preventDefault();
+			if (mutation || scope !== board) return;
+			const changes: InstructionChanges = {};
+			if (chatInput.value !== current.chat.body) changes.chat = { ...current.chat, body: chatInput.value };
+			if (permanentInput.value !== current.permanent.body)
+				changes.permanent = { ...current.permanent, body: permanentInput.value };
+			if (!instructionChanges.safeParse(changes).success) {
+				feedback.textContent = t.taskTextTooLong;
+				return;
+			}
+			mutation = true;
+			save.disabled = true;
+			form.inert = true;
+			try {
+				await call("save_instructions", { changes });
+				if (form.isConnected && scope === board) {
+					dialog.close();
+					transferMessage(t.instructionsSaved);
+				}
+			} catch (error) {
+				feedback.textContent =
+					error instanceof Error && error.message === "conflict" ? t.instructionsConflict : t.error;
+			} finally {
+				form.inert = false;
+				save.disabled = false;
+				finishMutation();
+			}
+		};
+	} catch {
+		if (loading.isConnected) loading.textContent = t.error;
+	}
+}
+
 async function fetchDetails(taskId: string, edit = false): Promise<void> {
 	dialogHeader(t.loading, !edit);
 	const currentHeading = dialogContent.querySelector("h2");
 	try {
-		const task = await call<Task>("get", { taskId });
+		const task = await call<PanelDetail>("get", { taskId });
 		if (dialog.open && currentHeading?.isConnected) {
 			if (edit) showEditor(task);
 			else showDetails(task);
@@ -475,11 +675,12 @@ async function fetchDetails(taskId: string, edit = false): Promise<void> {
 interface DiscussionDraft {
 	text: string;
 	focused: boolean;
+	preview: boolean;
 	pending: { body: string; id: string } | undefined;
 }
 
-function showDetails(task: Task, draft?: DiscussionDraft): void {
-	dialogHeader(task.title, true);
+function showDetails(task: PanelDetail, draft?: DiscussionDraft): void {
+	dialogHeader(task.reformulation?.title ?? task.title, true);
 	let readDiscussionDraft: (() => DiscussionDraft) | undefined;
 	const detailsState = element(
 		"p",
@@ -507,17 +708,31 @@ function showDetails(task: Task, draft?: DiscussionDraft): void {
 	if (task.state === "blocked")
 		mainActions.append(button(t.resolveBlocker, () => void updateTask("restore", task)));
 	if (mainActions.childElementCount) dialogContent.append(mainActions);
-	if (task.body || task.attachments.length) {
-		const context = element("details", undefined, "detail-context");
-		context.open = task.state !== "done";
-		context.append(element("summary", t.currentVersion), renderRevision(task, task, false));
-		dialogContent.append(context);
+	const context = element("details", undefined, "detail-context");
+	context.open = task.state !== "done";
+	const summary = element("summary", t.currentVersion);
+	const heading = dialogContent.querySelector("h2");
+	function updatePresentation(shown: PanelDetail): void {
+		context.hidden =
+			!shown.body && !shown.attachments.length && !shown.reformulation && !shown.reformulationPending;
+		if (heading) heading.textContent = shown.reformulation?.title ?? shown.title;
+		const old = context.querySelector(".revision");
+		const focused = [...(old?.querySelectorAll("button") ?? [])].indexOf(
+			document.activeElement as HTMLButtonElement,
+		);
+		const originalVisible = Boolean(old?.querySelector("pre.revision-source:not([hidden])"));
+		const revision = renderRevision(shown, shown, false);
+		if (originalVisible) revision.querySelector<HTMLButtonElement>(".revision-format")?.click();
+		context.replaceChildren(summary, revision);
+		if (focused >= 0) revision.querySelectorAll("button")[focused]?.focus({ preventScroll: true });
 	}
+	updatePresentation(task);
+	dialogContent.append(context);
 	if (task.receipt && task.state === "done" && !task.verification && task.receipt !== task.manualValidation)
-		dialogContent.append(element("p", task.receipt, "notice"));
+		dialogContent.append(markdownBlock(task.receipt, "markdown-content notice"));
 	if (task.manualValidation) {
 		const check = element("section", undefined, "detail-approval");
-		check.append(element("h3", t.validatedByYou), element("p", task.manualValidation, "comment-body"));
+		check.append(element("h3", t.validatedByYou), markdownBlock(task.manualValidation));
 		dialogContent.append(check);
 	}
 	if (task.verification) {
@@ -529,7 +744,9 @@ function showDetails(task: Task, draft?: DiscussionDraft): void {
 			[t.checkResult, task.verification.result],
 			[t.checkEvidence, task.verification.evidence],
 		] as const) {
-			proof.append(element("dt", label), element("dd", value));
+			const content = element("dd", undefined, "markdown-content");
+			updateMarkdown(content, value);
+			proof.append(element("dt", label), content);
 		}
 		checks.append(element("h3", t.codexVerification), proof);
 		dialogContent.append(checks);
@@ -567,7 +784,7 @@ function showDetails(task: Task, draft?: DiscussionDraft): void {
 		};
 	}
 	dialogContent.append(actions, history);
-	readDiscussionDraft = showDiscussion(task, draft);
+	readDiscussionDraft = showDiscussion(task, updatePresentation, draft);
 }
 
 function confirmRecovery(task: Task): void {
@@ -627,7 +844,7 @@ function showValidation(task: Task, draft?: DiscussionDraft): void {
 	form.onsubmit = async (event) => {
 		event.preventDefault();
 		if (mutation) return;
-		const proof = manualCheck.safeParse(observation.value.trim());
+		const proof = manualCheck.safeParse(observation.value);
 		if (!proof.success) {
 			feedback.textContent = t.manualCheck;
 			observation.focus();
@@ -661,7 +878,13 @@ function showValidation(task: Task, draft?: DiscussionDraft): void {
 	observation.focus();
 }
 
-function showDiscussion(task: Task, savedDraft?: DiscussionDraft): () => DiscussionDraft {
+function showDiscussion(
+	task: PanelDetail,
+	updatePresentation: (task: PanelDetail) => void,
+	savedDraft?: DiscussionDraft,
+): () => DiscussionDraft {
+	let pendingFormat = Boolean(task.reformulationPending);
+	let hasFormat = Boolean(task.reformulation);
 	const section = element("section", undefined, "task-discussion");
 	const list = element("ol", undefined, "comment-list");
 	const form = element("form");
@@ -669,6 +892,7 @@ function showDiscussion(task: Task, savedDraft?: DiscussionDraft): () => Discuss
 	input.required = true;
 	input.maxLength = 8192;
 	input.value = savedDraft?.text ?? "";
+	const editor = markdownEditor(t.addComment, input, savedDraft?.preview);
 	const post = element("button", t.postComment, "detail-publish");
 	post.type = "submit";
 	const feedback = element("p", undefined, "notice");
@@ -700,10 +924,7 @@ function showDiscussion(task: Task, savedDraft?: DiscussionDraft): () => Discuss
 				const avatar = element("span", t[comment.author].slice(0, 1), "comment-avatar");
 				avatar.setAttribute("aria-hidden", "true");
 				const message = element("div", undefined, "comment-message");
-				message.append(
-					group(element("strong", label), timestamp),
-					element("p", comment.body, "comment-body"),
-				);
+				message.append(group(element("strong", label), timestamp), markdownBlock(comment.body));
 				item.append(avatar, message);
 				return item;
 			}),
@@ -713,18 +934,32 @@ function showDiscussion(task: Task, savedDraft?: DiscussionDraft): () => Discuss
 		if (loading || !section.isConnected) return;
 		loading = true;
 		try {
-			const page = await call<CommentsPage & { taskSerial: number }>("comments", { taskId: task.id, before });
-			if (page.taskSerial !== task.serial && !post.disabled) {
-				const updated = await call<Task>("get", { taskId: task.id });
+			const page = await call<
+				CommentsPage & {
+					taskSerial: number;
+					reformulationPending: boolean;
+					hasReformulation: boolean;
+				}
+			>("comments", { taskId: task.id, before });
+			const presentationChanged =
+				pendingFormat !== Boolean(page.reformulationPending) || hasFormat !== Boolean(page.hasReformulation);
+			if ((page.taskSerial !== task.serial || presentationChanged) && !post.disabled) {
+				const updated = await call<PanelDetail>("get", { taskId: task.id });
 				if (!dialog.open || !section.isConnected) return;
-				const scroll = dialog.scrollTop;
-				showDetails(updated, {
-					text: input.value,
-					focused: document.activeElement === input,
-					pending: draft,
-				});
-				dialog.scrollTop = scroll;
-				return;
+				if (updated.serial !== task.serial) {
+					const scroll = dialog.scrollTop;
+					showDetails(updated, {
+						text: input.value,
+						focused: document.activeElement === input,
+						preview: editor.isPreview(),
+						pending: draft,
+					});
+					dialog.scrollTop = scroll;
+					return;
+				}
+				pendingFormat = Boolean(updated.reformulationPending);
+				hasFormat = Boolean(updated.reformulation);
+				updatePresentation(updated);
 			}
 			const activeBlocker = page.taskSerial === task.serial ? page.currentBlocker : blocker;
 			let changed = activeBlocker?.createdAt !== blocker?.createdAt || activeBlocker?.body !== blocker?.body;
@@ -758,7 +993,7 @@ function showDiscussion(task: Task, savedDraft?: DiscussionDraft): () => Discuss
 	form.onsubmit = async (event) => {
 		event.preventDefault();
 		if (post.disabled) return;
-		const body = commentBody.safeParse(input.value.trim());
+		const body = commentBody.safeParse(input.value);
 		if (!body.success) {
 			feedback.textContent = t.addComment;
 			return;
@@ -785,14 +1020,19 @@ function showDiscussion(task: Task, savedDraft?: DiscussionDraft): () => Discuss
 	form.ondrop = (event) => event.stopPropagation();
 	const composerActions = group(post);
 	composerActions.classList.add("comment-actions");
-	form.append(field(t.addComment, input), composerActions, feedback);
+	form.append(editor.wrapper, composerActions, feedback);
 	section.append(element("h3", t.comments), older, list, readError, form);
 	dialogContent.append(section);
 	if (savedDraft?.focused) input.focus({ preventScroll: true });
 	renderComments();
 	refreshDiscussion = () => load();
 	void load();
-	return () => ({ text: input.value, focused: document.activeElement === input, pending: draft });
+	return () => ({
+		text: input.value,
+		focused: document.activeElement === input,
+		preview: editor.isPreview(),
+		pending: draft,
+	});
 }
 
 function attachmentView(file: Attachment, open: () => void): HTMLElement {
@@ -850,7 +1090,7 @@ async function showHistory(task: Task, container: HTMLElement, before?: number):
 	}
 }
 
-function renderRevision(task: Task, revision: Revision, includeTitle = true): HTMLElement {
+function renderRevision(task: PanelDetail, revision: Revision, includeTitle = true): HTMLElement {
 	const section = element("section", undefined, "revision");
 	const label =
 		revision.revision === task.revision
@@ -862,7 +1102,23 @@ function renderRevision(task: Task, revision: Revision, includeTitle = true): HT
 	section.append(
 		element("p", `${label} · ${t[revision.author]} · ${dateFormat.format(revision.createdAt)}`, "meta"),
 	);
-	if (revision.body) section.append(element("pre", revision.body));
+	const formatted = includeTitle ? undefined : task.reformulation;
+	if (!includeTitle && task.reformulationPending) section.append(element("p", t.titlePending, "meta"));
+	if (revision.body || formatted) {
+		const rendered = markdownBlock(formatted?.body ?? revision.body);
+		const raw =
+			formatted && revision.body ? `${revision.title}\n\n${revision.body}` : revision.body || revision.title;
+		const source = element("pre", raw, "revision-source");
+		source.hidden = true;
+		const rawLabel = formatted ? t.originalText : t.markdownText;
+		const toggle = button(rawLabel, () => {
+			source.hidden = !source.hidden;
+			rendered.hidden = !source.hidden;
+			toggle.textContent = source.hidden ? rawLabel : t.markdownPreview;
+		});
+		toggle.classList.add("revision-format");
+		section.append(rendered, source, toggle);
+	}
 	if (revision.attachments.length)
 		section.append(
 			group(...revision.attachments.map((file) => attachmentView(file, () => void preview(task.id, file)))),
@@ -912,6 +1168,7 @@ function showEditor(task?: Task, focusContext = false): void {
 	body.name = "body";
 	body.maxLength = MAX_TASK_BODY_BYTES;
 	body.value = task?.body ?? "";
+	const editor = markdownEditor(t.detail, body);
 	const mode = element("select");
 	mode.name = "mode";
 	mode.add(new Option(t.auto, "auto"));
@@ -924,7 +1181,7 @@ function showEditor(task?: Task, focusContext = false): void {
 	const attachments = makeAttachments(task, status);
 	form.append(
 		field(task ? t.title : t.optionalTitle, title),
-		field(t.detail, body),
+		editor.wrapper,
 		field(t.delegation, mode),
 		attachments.section,
 		status,
@@ -932,7 +1189,10 @@ function showEditor(task?: Task, focusContext = false): void {
 	);
 	const addContext = (context: TransferredContext) => {
 		if (context.files.length) attachments.addFiles(context.files);
-		if (context.text) body.value = appendContextText(body.value, context.text);
+		if (context.text) {
+			body.value = appendContextText(body.value, context.text);
+			editor.refresh();
+		}
 	};
 	installDropSurface(form, addContext);
 	form.onpaste = (event) => {
@@ -964,6 +1224,7 @@ function showEditor(task?: Task, focusContext = false): void {
 		const files = attachments.selectedFiles();
 		if (!providedTitle && !hasContext({ files, text: details })) {
 			status.textContent = t.addTaskContext;
+			editor.setPreview(false);
 			body.focus();
 			return;
 		}
@@ -1010,14 +1271,10 @@ function showEditor(task?: Task, focusContext = false): void {
 					preserveTitle: providedTitle === task.title,
 					preserveBody: details === task.body || (previouslyEmpty && !details.trim()),
 					appendBody: previouslyEmpty && details.trim() ? details : "",
+					...(providedTitle !== task.title || details !== task.body ? { reformulate: locale } : {}),
 				});
 			}
-			const titleOptions = !providedTitle
-				? { generateTitle: locale }
-				: titleOnly
-					? { splitTitle: locale }
-					: {};
-			const added = task ? undefined : await createTask({ taskId, input, ...titleOptions }, true);
+			const added = task ? undefined : await createTask({ taskId, input, reformulate: locale }, true);
 			if (scope !== board) return;
 			dialog.close();
 			if (added) {
@@ -1189,8 +1446,9 @@ async function saveDroppedContext(
 								preserveTitle: true,
 								preserveBody: !context.text,
 								appendBody: context.text,
+								...(context.text ? { reformulate: locale } : {}),
 							}
-						: {}),
+						: { ...(context.text ? { reformulate: locale } : {}) }),
 					input: {
 						title: task?.title ?? contextTitle(context, t.newTask),
 						body: task?.body ?? context.text,
@@ -1277,6 +1535,7 @@ app.ontoolresult = (result) => {
 	scope = binding.data;
 	dialog.close();
 	add.disabled = false;
+	instructionsButton.disabled = false;
 	quickTitle.disabled = false;
 	quickSubmit.disabled = false;
 	for (const { toggle } of filterButtons) toggle.disabled = false;
