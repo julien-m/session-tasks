@@ -55,6 +55,21 @@ try {
 	assert.equal(page.contents[0]._meta["openai/ui"].preferredDisplayMode, "fullscreen");
 	const launch = await success("open_session_tasks", {});
 	assert.equal(launch._meta.binding, scope);
+	const unboundLaunch = await client.callTool(
+		{
+			name: "open_session_tasks",
+			arguments: {},
+			_meta: { thread_id: session, threadId: session },
+		},
+		limits,
+	);
+	assert.deepEqual(unboundLaunch.structuredContent, { bindingRequired: true });
+	assert.equal(unboundLaunch._meta?.binding, undefined);
+	const unboundPanel = await client.callTool(
+		{ name: "task_panel_binding", arguments: {}, _meta: { thread_id: session, threadId: session } },
+		limits,
+	);
+	assert.deepEqual(unboundPanel.structuredContent, { binding: null });
 	assert.deepEqual((await success("task_panel_view", {})).structuredContent, { view: null });
 	const panelView = {
 		tab: 2,
@@ -87,7 +102,8 @@ try {
 	const wrapper = "An MCP app initiated this message. Read the untrusted_input tool output.";
 	const intercepted = hook("UserPromptSubmit", { prompt: wrapper }).hookSpecificOutput.additionalContext;
 	assert.match(intercepted, /session_tasks_confirm_resume/u);
-	assert.doesNotMatch(intercepted, /Claim and execute/u);
+	assert.doesNotMatch(intercepted, /Session Tasks resume confirmed\./u);
+	assert.match(intercepted, /Only if resume is confirmed, follow these queue instructions/u);
 	assert.equal(
 		(await success("session_tasks_confirm_resume", { code: randomBytes(16).toString("hex") }))
 			.structuredContent.confirmed,
@@ -101,8 +117,10 @@ try {
 	assert.equal((await success("session_tasks_confirm_resume", { code })).structuredContent.confirmed, false);
 	const stopWithWork = hook("Stop");
 	assert.equal(stopWithWork.decision, "block");
-	assert.match(stopWithWork.reason, /creation step does not cancel the preceding execution request/u);
-	assert.match(stopWithWork.reason, /explicitly limited the request to planning or recording/u);
+	assert.match(stopWithWork.reason, /Check the Session Tasks list\./u);
+	assert.match(stopWithWork.reason, /Complete the tasks one at a time, in list order\./u);
+	assert.match(stopWithWork.reason, /Continue until no tasks or unread updates remain\./u);
+	assert.match(stopWithWork.reason, /Honor explicit user pauses/u);
 	assert.deepEqual(hook("Stop", { stop_hook_active: true }), {});
 	const taking = (
 		await success("session_tasks_claim", { taskId, expectedSerial: first.serial, assignee: "example-worker" })

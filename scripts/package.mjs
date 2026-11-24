@@ -1,6 +1,15 @@
 /** Creates a local marketplace from an explicit list of distributable files. */
-import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { copyFile, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+
+async function nodeCommand() {
+	const executable = await realpath(process.execPath);
+	for (const directory of (process.env.PATH ?? "").split(delimiter).filter(isAbsolute)) {
+		const candidate = join(directory, "node");
+		if ((await realpath(candidate).catch(() => undefined)) === executable) return candidate;
+	}
+	return process.execPath;
+}
 
 const root = "artifacts/marketplace";
 const target = join(root, "plugins/session-tasks");
@@ -18,11 +27,15 @@ for (const file of [
 	await mkdir(dirname(destination), { recursive: true });
 	await copyFile(file, destination);
 }
-const portableMcp = JSON.parse(await readFile("mcp.json", "utf8"));
-const server = portableMcp.mcpServers["session-tasks"];
+const { version } = JSON.parse(await readFile(".codex-plugin/plugin.json", "utf8"));
+// A changed command configuration makes Codex start a fresh MCP child on upgrade.
+const server = {
+	command: await nodeCommand(),
+	args: [resolve("dist/stdio-server.mjs"), `--release=${version}`],
+};
 await writeFile(
 	join(target, ".mcp.json"),
-	`${JSON.stringify({ mcpServers: { "session-tasks": { url: server.url } } }, null, 2)}\n`,
+	`${JSON.stringify({ mcpServers: { "session-tasks": server } }, null, 2)}\n`,
 );
 const registry = join(root, ".agents/plugins/marketplace.json");
 await mkdir(dirname(registry), { recursive: true });

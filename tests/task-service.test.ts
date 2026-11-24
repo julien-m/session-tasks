@@ -66,7 +66,13 @@ test("the Stop hook checks newly queued work and unread comments during its cont
 
 	expect(stop()).toEqual({});
 	const first = add("First task");
-	expect(stop()).toMatchObject({ decision: "block" });
+	const firstStop = stop();
+	expect(firstStop).toMatchObject({
+		decision: "block",
+		reason: expect.stringMatching(/Check the Session Tasks list\..*one at a time, in list order\./u),
+	});
+	expect(JSON.stringify(firstStop)).toContain("Continue until no tasks or unread updates remain.");
+	expect(JSON.stringify(firstStop)).toContain("Honor explicit user pauses");
 	add("Other chat", other);
 	expect(stop(true)).toEqual({});
 	add("New task during the stop review");
@@ -120,17 +126,19 @@ test("notifies only the owning chat about a new panel comment and retains it unt
 		JSON.stringify(taskHook(persisted, { hook_event_name: "UserPromptSubmit", session_id: chat, prompt }));
 	const prompt = catalog("en").commentResumePrompt;
 	const bundle = `${prompt}\n\n${resumeCodePrefix}${code}`;
-	expect(submit(prompt)).not.toContain("Claim and execute");
+	expect(submit(prompt)).not.toContain("Session Tasks resume confirmed.");
 	expect(submit("An MCP app initiated this message. Read the untrusted_input tool output.")).not.toContain(
-		"Claim and execute",
+		"Session Tasks resume confirmed.",
 	);
 	expect(persisted.consumeResume(other, code ?? "")).toBe(false);
 	const resumed = submit(bundle);
-	expect(resumed).toContain("Claim and execute");
-	expect(resumed.indexOf("session_tasks_comment_notifications")).toBeLessThan(
-		resumed.indexOf("Claim and execute"),
+	expect(resumed).toContain("Session Tasks resume confirmed.");
+	expect(resumed).toContain("session_tasks_comment_notifications");
+	expect(resumed.indexOf("Read all unread comments")).toBeLessThan(
+		resumed.indexOf("Complete the tasks one at a time"),
 	);
-	expect(submit(bundle)).not.toContain("Claim and execute");
+	expect(resumed).toContain("Reopen a task if the feedback calls for more work");
+	expect(submit(bundle)).not.toContain("Session Tasks resume confirmed.");
 	expect(persisted.acknowledgeComment(scope, comment.ordinal)).toBe(true);
 	expect(persisted.acknowledgeComment(scope, comment.ordinal)).toBe(false);
 	expect(persisted.commentFromPanel(scope, task.id, id, body, [])).toEqual({ comment, optimized: false });

@@ -28,14 +28,15 @@ Clicking a shortcut sends it to the chat that owns the open panel. The host carr
 
 ## Host integration
 
-The plugin uses the supported MCP App thread tab and lifecycle hooks. The desired inline location between Outputs and Sources is a host integration requirement. The installed host composes that rail from built-in sections and its public MCP entrypoints support a thread tab without a rail placement field.
+The plugin registers **Session Tasks** in the chat's side-panel tab picker. Choose it to open the current chat's board without sending a message. The local Codex plugin accepts the current chat identifier from the desktop host over its private stdio connection. The **Sources** list remains part of the Codex summary.
 
 ## Install from the source checkout
 
 1. Run `npm ci` and `npm run package` in the plugin checkout.
-2. Register the checkout and `node <checkout>/dist/http-server.mjs 46173` with Localhost Supervisor. Use the loopback port `46173`, autostart `agent-start` and restart `on-failure` for the durable MCP endpoint.
-3. Use `codex plugin marketplace add ./artifacts/marketplace` and `codex plugin add session-tasks@session-tasks-local`. Review the bundled hook definitions in the host and approve the ones you want to run. Open a fresh chat so it loads the plugin.
-4. Submit a work request. The `UserPromptSubmit` hook supplies the exact task board; Codex registers actionable items and requests the native Session Tasks tab. The first open and visibility depend on the host. An unbound tab asks to be opened by the agent in the chat.
+2. Use `codex plugin marketplace add ./artifacts/marketplace` and `codex plugin add session-tasks@session-tasks-local`. Review the bundled hook definitions in the host and approve the ones you want to run. Keep the checkout and its Node runtime available to Codex.
+3. Open a chat, then select **Session Tasks** from the side-panel tab picker. When you submit a work request, the `UserPromptSubmit` hook supplies the same board to Codex.
+
+For HTTP clients or the integration verifier, you can also run `node <checkout>/dist/http-server.mjs 46173` using Localhost Supervisor. HTTP callers must provide a board capability to open the panel.
 
 During a turn, add entries directly in the panel. Codex rereads the queue between tasks. The Stop hook asks Codex to check for pending work and unread updates before ending the turn. If the board changes during that check, the hook can ask again, up to three checks per turn. When the first new task is added to a drained board after the local chat's last turn has ended, the panel asks Codex to resume that chat with a short prompt. **Resume** is available when the host supports messages and the automatic wake could not be confirmed. **Release claim** lets you return an abandoned item to the queue after checking the previous worker has stopped. The old claim becomes invalid immediately. **Cancel task** is reversible from the Cancelled list.
 

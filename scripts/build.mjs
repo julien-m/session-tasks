@@ -12,7 +12,7 @@ const [panel] = await Promise.all([
 		minify: true,
 	}),
 	build({
-		entryPoints: { "http-server": "src/http-server.ts" },
+		entryPoints: { "http-server": "src/http-server.ts", "stdio-server": "src/stdio-server.ts" },
 		outdir: "dist",
 		outExtension: { ".js": ".mjs" },
 		platform: "node",

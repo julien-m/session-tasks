@@ -10,6 +10,7 @@ import {
 	McpServer,
 	ResourceNotFoundError,
 	ResourceTemplate,
+	type ServerContext,
 } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { chatCanResume } from "./chat-activity.ts";
@@ -93,11 +94,11 @@ function result(value: object, modelVisible: boolean): CallToolResult {
 }
 
 function protection<T>(
-	action: (args: T) => CallToolResult | Promise<CallToolResult>,
-): (args: T) => Promise<CallToolResult> {
-	return async (args) => {
+	action: (args: T, context: ServerContext) => CallToolResult | Promise<CallToolResult>,
+): (args: T, context: ServerContext) => Promise<CallToolResult> {
+	return async (args, context) => {
 		try {
-			return await action(args);
+			return await action(args, context);
 		} catch (error) {
 			if (!(error instanceof TaskError))
 				process.stderr.write(`${JSON.stringify({ event: "task_operation_failed", level: "error" })}\n`);
@@ -109,16 +110,27 @@ function protection<T>(
 	};
 }
 
+const desktopThreadMetadata = z
+	.object({ thread_id: z.uuid(), threadId: z.uuid() })
+	.refine((metadata) => metadata.thread_id === metadata.threadId);
+
 /** Makes fresh protocol handlers per HTTP request against the shared task service. */
 export function createTaskMcp(
 	service: TaskService,
 	html: string,
 	version: string,
 	actions: QuickActions,
+	{ desktopStdio = false } = {},
 ): McpServer {
 	const server = new McpServer({ name: "session-tasks", version, icons });
 	const resourceUri = `ui://session-tasks/tasks-${encodeURIComponent(version)}.html`;
 	const uiMeta = { resourceUri, visibility: ["app"] as ["app"] };
+	const desktopBinding = (context: ServerContext): string | undefined => {
+		if (!desktopStdio) return undefined;
+		// Codex owns this pipe and supplies both fields for the current chat.
+		const metadata = desktopThreadMetadata.safeParse(context.mcpReq._meta);
+		return metadata.success ? service.bind(metadata.data.threadId) : undefined;
+	};
 	const agent = <T>(
 		name: string,
 		description: string,
@@ -147,6 +159,12 @@ export function createTaskMcp(
 		);
 	};
 	const actionIdentity = scoped.extend({ actionId: id });
+	registerAppTool(
+		server,
+		"task_panel_binding",
+		{ inputSchema: z.strictObject({}), annotations: annotations(true), _meta: { ui: uiMeta } },
+		protection((_args, context) => result({ binding: desktopBinding(context) ?? null }, false)),
+	);
 	panel("task_panel_view", scoped, true, ({ scope }) => ({ view: service.readPanelView(scope) }));
 	panel("task_panel_save_view", scoped.extend({ view: boardPanelView }), false, ({ scope, view }) => {
 		service.savePanelView(scope, view);
@@ -287,10 +305,11 @@ export function createTaskMcp(
 		server,
 		"open_session_tasks",
 		openTool,
-		protection(({ scope }: { scope?: string | undefined }) => {
-			if (!scope) return result({ bindingRequired: true }, false);
-			service.list(scope);
-			return { ...result({ openingRequested: true }, true), _meta: { binding: scope } };
+		protection(({ scope }: { scope?: string | undefined }, context) => {
+			const binding = scope ?? desktopBinding(context);
+			if (!binding) return result({ bindingRequired: true }, false);
+			service.list(binding);
+			return { ...result({ openingRequested: true }, true), _meta: { binding } };
 		}),
 	);
 

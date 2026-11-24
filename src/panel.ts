@@ -3115,10 +3115,8 @@ document.addEventListener("paste", (event) => {
 	void saveDroppedContext(context, dropTaskId(event.target));
 });
 
-app.ontoolresult = async (result) => {
-	const binding = id.safeParse(result._meta?.binding);
-	if (!binding.success) return;
-	if (scope === binding.data) {
+async function connectBoard(binding: string): Promise<void> {
+	if (scope === binding) {
 		if (!viewReady) return;
 		void refreshActions();
 		if (!dialog.open && !taskPanel.hidden) void refresh(true);
@@ -3126,7 +3124,7 @@ app.ontoolresult = async (result) => {
 		return;
 	}
 	flushPanelViewScroll();
-	scope = binding.data;
+	scope = binding;
 	const initialBinding = ++viewBindingGeneration;
 	viewReady = false;
 	viewWritable = false;
@@ -3200,6 +3198,10 @@ app.ontoolresult = async (result) => {
 	void refreshActions();
 	if (!taskPanel.hidden) void refresh(true, !saved);
 	if (!instructionPanel.hidden) void refreshInstructionProjects().then(refreshInstructions);
+}
+app.ontoolresult = async (result) => {
+	const binding = id.safeParse(result._meta?.binding);
+	if (binding.success) await connectBoard(binding.data);
 };
 function updateHostStyle(context?: McpUiHostContext): void {
 	if (context?.theme) applyDocumentTheme(context.theme);
@@ -3214,9 +3216,18 @@ app.onteardown = async () => {
 try {
 	await app.connect();
 	updateHostStyle(app.getHostContext());
+	if (!scope && app.getHostCapabilities()?.serverTools) {
+		notice.textContent = t.loading;
+		const { structuredContent } = await app.callServerTool(
+			{ name: "task_panel_binding", arguments: {} },
+			{ timeout: 3000, maxTotalTimeout: 3000 },
+		);
+		const binding = id.safeParse((structuredContent as { binding?: unknown } | undefined)?.binding);
+		if (!scope && binding.success) await connectBoard(binding.data);
+	}
 	if (!scope) notice.textContent = t.connect;
 } catch {
-	notice.textContent = t.error;
+	if (!scope) notice.textContent = t.error;
 }
 const timer = window.setInterval(() => {
 	if (document.hidden || mutation || !viewReady) return;

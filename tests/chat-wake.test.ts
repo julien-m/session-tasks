@@ -79,7 +79,7 @@ test("grants a single wake for a new panel item and treats resume as a control p
 		const code = service.requestResume(scope);
 		if (!earlier || !code) throw new Error("Expected independent resume codes");
 		expect(taskHook(service, wrapper)).not.toMatchObject({
-			hookSpecificOutput: { additionalContext: expect.stringContaining("Claim and execute") },
+			hookSpecificOutput: { additionalContext: expect.stringContaining("Session Tasks resume confirmed.") },
 		});
 		expect(taskHook(service, wrapper)).toMatchObject({
 			hookSpecificOutput: { additionalContext: expect.stringContaining("session_tasks_confirm_resume") },
@@ -94,7 +94,7 @@ test("grants a single wake for a new panel item and treats resume as a control p
 			prompt: `${catalog("fr").automaticResumePrompt}\n\n${resumeCodePrefix}${earlier}`,
 		};
 		const confirmed = {
-			hookSpecificOutput: { additionalContext: expect.stringContaining("Claim and execute") },
+			hookSpecificOutput: { additionalContext: expect.stringContaining("Session Tasks resume confirmed.") },
 		};
 		expect(taskHook(service, direct)).toMatchObject(confirmed);
 		expect(taskHook(service, direct)).not.toMatchObject(confirmed);
