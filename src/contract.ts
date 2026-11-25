@@ -55,6 +55,7 @@ export const boardNote = z
 	.strict();
 export type BoardNote = z.infer<typeof boardNote>;
 export const boardNotePanel = boardNote.extend({ formatting: z.boolean().optional() });
+export const boardNoteSummary = boardNote.pick({ revision: true }).extend({ hasContent: z.boolean() });
 export const MAX_BOARD_INSTRUCTIONS_BYTES = 4096;
 export const boardInstructionsBody = textBytes(MAX_BOARD_INSTRUCTIONS_BYTES);
 const instructionDocument = z.object({

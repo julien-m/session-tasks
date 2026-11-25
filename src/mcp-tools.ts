@@ -208,13 +208,17 @@ export function createTaskMcp(
 		true,
 	);
 	const actionVersion = actionIdentity.extend({ revision: serial });
-	panel("task_panel_actions", scoped, true, ({ scope }) => ({
-		actions: actions.list(scope).map(({ body: _, ...item }) => ({
-			...item,
-			...(isReformulationPending(item.id, item.revision, "action") ? { optimizing: true } : {}),
-		})),
-		projects: service.listInstructionProjects(scope),
-	}));
+	panel("task_panel_actions", scoped, true, ({ scope }) => {
+		const note = service.readNote(scope);
+		return {
+			actions: actions.list(scope).map(({ body: _, ...item }) => ({
+				...item,
+				...(isReformulationPending(item.id, item.revision, "action") ? { optimizing: true } : {}),
+			})),
+			projects: service.listInstructionProjects(scope),
+			noteSummary: { revision: note.revision, hasContent: Boolean(note.body.trim()) },
+		};
+	});
 	panel("task_panel_get_action", actionIdentity, true, ({ scope, actionId }) => actions.get(scope, actionId));
 	panel(
 		"task_panel_save_action",

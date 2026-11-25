@@ -24,6 +24,7 @@ import {
 	boardInstructionsBody,
 	boardNote,
 	boardNotePanel,
+	boardNoteSummary,
 	boardPanelView,
 	byteLength,
 	commentContent,
@@ -408,6 +409,12 @@ const instructionTab = button(t.instructions, () => selectBoardTab(1));
 const actionsTab = button(t.quickActions, () => selectBoardTab(2));
 const notesTab = button(t.notes, () => selectBoardTab(3));
 const tabs = [taskTab, instructionTab, actionsTab, notesTab];
+
+function setTabCount(tab: HTMLButtonElement, label: string, count: number): void {
+	const text = count ? `${label} ${count}` : label;
+	if (tab.textContent !== text) tab.textContent = text;
+}
+
 const tabList = group(...tabs);
 tabList.classList.add("board-tabs");
 tabList.setAttribute("role", "tablist");
@@ -940,7 +947,7 @@ function render(counts: BoardList["counts"], pendingUpdates: boolean): void {
 	progress.max = Math.max(1, total);
 	progress.value = counts.done;
 	progressText.textContent = total ? `${counts.done}/${total}` : "";
-	taskTab.textContent = total ? `${t.heading} ${total}` : t.heading;
+	setTabCount(taskTab, t.heading, total);
 	progressText.setAttribute("aria-label", t.completed({ done: counts.done, total }));
 	const hasPreviousPage = pageHistory.length > 0 || previousAfter !== null;
 	const hasNextPage = next !== null;
@@ -1233,6 +1240,7 @@ function selectBoardTab(selected: number, restoring = false): void {
 
 let currentNote: BoardNote | undefined;
 let noteRequest = 0;
+let noteCountRevision = -1;
 let displayedNote = "";
 let noteReadInFlight = false;
 
@@ -1254,9 +1262,17 @@ function noteIcon(kind: "task" | "delete", action: () => void): HTMLButtonElemen
 	return control;
 }
 
+function setNoteCount(revision: number, hasContent: boolean): void {
+	// The sidebar summary and the note editor can return out of order.
+	if (revision < noteCountRevision) return;
+	noteCountRevision = revision;
+	setTabCount(notesTab, t.notes, Number(hasContent));
+}
+
 function renderNote(): void {
 	const body = currentNote?.body ?? "";
 	const hasBody = Boolean(body.trim());
+	if (currentNote) setNoteCount(currentNote.revision, hasBody);
 	notePreview.replaceChildren(hasBody ? markdownBlock(body) : element("p", t.noteEmpty, "meta"));
 	notePreview.classList.toggle("note-editable", hasBody);
 	noteAdd.hidden = hasBody;
@@ -1313,6 +1329,7 @@ async function refreshNote(): Promise<void> {
 
 function confirmNoteDeletion(): void {
 	const board = scope;
+	const generation = viewBindingGeneration;
 	const revision = currentNote?.revision;
 	if (!board || revision === undefined) return;
 	dialogHeader(t.noteDeleteTitle);
@@ -1326,12 +1343,12 @@ function confirmNoteDeletion(): void {
 	cancel.focus();
 
 	async function remove(): Promise<void> {
-		if (mutation || scope !== board) return;
+		if (mutation || generation !== viewBindingGeneration) return;
 		mutation = true;
 		confirm.disabled = true;
 		try {
 			const saved = boardNote.parse(await call("delete_note", { revision }));
-			if (scope !== board) return;
+			if (generation !== viewBindingGeneration) return;
 			noteRequest++;
 			currentNote = saved;
 			noteFormatting.hidden = true;
@@ -1340,7 +1357,7 @@ function confirmNoteDeletion(): void {
 			showSuccessNotice(noteNotice, t.noteDeleted);
 			noteAdd.focus();
 		} catch (error) {
-			if (scope === board) {
+			if (generation === viewBindingGeneration) {
 				feedback.textContent =
 					error instanceof Error && error.message === "conflict" ? t.noteDeleteConflict : t.error;
 			}
@@ -1411,13 +1428,17 @@ function colorAction(button: HTMLElement, color: string | null): void {
 
 async function refreshActions(): Promise<void> {
 	if (!scope || actionLoading) return;
-	const board = scope;
+	const generation = viewBindingGeneration;
 	actionLoading = true;
 	try {
-		const { actions, projects } = await call<{ actions: ActionSummary[]; projects: InstructionProject[] }>(
-			"actions",
-		);
-		if (scope !== board) return;
+		const { actions, projects, noteSummary } = await call<{
+			actions: ActionSummary[];
+			projects: InstructionProject[];
+			noteSummary?: unknown;
+		}>("actions");
+		if (generation !== viewBindingGeneration) return;
+		const parsedNote = boardNoteSummary.safeParse(noteSummary);
+		if (parsedNote.success) setNoteCount(parsedNote.data.revision, parsedNote.data.hasContent);
 		const signature = JSON.stringify(actions);
 		actionProjects = projects;
 		if (signature === actionSignature) {
@@ -1426,6 +1447,7 @@ async function refreshActions(): Promise<void> {
 		}
 		actionSignature = signature;
 		const available = actions.filter((action) => action.available);
+		setTabCount(actionsTab, t.quickActions, available.length);
 		actionShelf.hidden = available.length === 0;
 		const focused =
 			document.activeElement instanceof HTMLElement ? document.activeElement.dataset.actionFocus : undefined;
@@ -1496,9 +1518,10 @@ async function refreshActions(): Promise<void> {
 				.querySelector<HTMLElement>(`[data-action-focus="${CSS.escape(focused)}"]`)
 				?.focus({ preventScroll: true });
 	} catch {
-		if (scope === board && !actionsPanel.hidden) actionLibraryFeedback.textContent = t.error;
+		if (generation === viewBindingGeneration && !actionsPanel.hidden)
+			actionLibraryFeedback.textContent = t.error;
 	} finally {
-		actionLoading = false;
+		if (generation === viewBindingGeneration) actionLoading = false;
 	}
 }
 
@@ -1729,9 +1752,7 @@ async function refreshInstructions(): Promise<void> {
 			: displayed.length
 				? ""
 				: t.instructionsEmpty;
-		instructionTab.textContent = applicable.length
-			? `${t.instructions} ${applicable.length}`
-			: t.instructions;
+		setTabCount(instructionTab, t.instructions, applicable.length);
 		const signature = JSON.stringify([displayed, instructionHistory, instructionProjects]);
 		if (signature === instructionSignature) {
 			restorePanelScroll(1);
@@ -3487,8 +3508,14 @@ async function connectBoard(binding: string): Promise<void> {
 	instructionRequest++;
 	dialog.close();
 	for (const tab of tabs) tab.disabled = true;
+	setTabCount(taskTab, t.heading, 0);
+	setTabCount(instructionTab, t.instructions, 0);
+	setTabCount(actionsTab, t.quickActions, 0);
+	setTabCount(notesTab, t.notes, 0);
+	noteCountRevision = -1;
 	add.disabled = true;
 	actionAdd.disabled = true;
+	actionLoading = false;
 	actionSignature = "";
 	actionShelf.hidden = true;
 	actionButtons.replaceChildren();
@@ -3507,7 +3534,6 @@ async function connectBoard(binding: string): Promise<void> {
 	noteNotice.textContent = "";
 	setNoteEditing(false);
 	renderNote();
-	instructionTab.textContent = t.instructions;
 	quickInstruction.value = "";
 	unsavedInstruction = undefined;
 	instructionList.replaceChildren();
