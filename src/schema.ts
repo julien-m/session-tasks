@@ -1,18 +1,27 @@
 /** SQLite schema for scoped task identities, immutable revisions and local files. */
+import { MAX_BOARD_NOTE_BYTES } from "./contract.ts";
+
 export const MAX_STOP_PASSES = 3;
+
+export const BOARD_PANEL_VIEW_SCHEMA = `CREATE TABLE IF NOT EXISTS board_panel_view (
+  scope TEXT NOT NULL PRIMARY KEY REFERENCES board(scope) ON DELETE CASCADE,
+  tab INTEGER NOT NULL CHECK(tab BETWEEN 0 AND 3),
+  filters INTEGER NOT NULL CHECK(filters BETWEEN 0 AND 8),
+  instruction_history INTEGER NOT NULL CHECK(instruction_history IN (0,1)),
+  task_cursor INTEGER NOT NULL CHECK(task_cursor BETWEEN 0 AND 9007199254740991),
+  scroll_top INTEGER NOT NULL CHECK(scroll_top BETWEEN 0 AND 9007199254740991)
+) STRICT;`;
 
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS board (
   thread_id TEXT NOT NULL PRIMARY KEY CHECK(length(CAST(thread_id AS BLOB)) BETWEEN 1 AND 256),
   scope TEXT NOT NULL UNIQUE CHECK(length(scope)=36)
 ) STRICT;
-CREATE TABLE IF NOT EXISTS board_panel_view (
+${BOARD_PANEL_VIEW_SCHEMA}
+CREATE TABLE IF NOT EXISTS board_note (
   scope TEXT NOT NULL PRIMARY KEY REFERENCES board(scope) ON DELETE CASCADE,
-  tab INTEGER NOT NULL CHECK(tab BETWEEN 0 AND 2),
-  filters INTEGER NOT NULL CHECK(filters BETWEEN 0 AND 8),
-  instruction_history INTEGER NOT NULL CHECK(instruction_history IN (0,1)),
-  task_cursor INTEGER NOT NULL CHECK(task_cursor BETWEEN 0 AND 9007199254740991),
-  scroll_top INTEGER NOT NULL CHECK(scroll_top BETWEEN 0 AND 9007199254740991)
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) <= ${MAX_BOARD_NOTE_BYTES})
 ) STRICT;
 CREATE TABLE IF NOT EXISTS quick_action (
   id TEXT PRIMARY KEY CHECK(length(id)=36),
@@ -41,6 +50,14 @@ CREATE TABLE IF NOT EXISTS quick_action_ticket (
   PRIMARY KEY(scope,action_id),
   UNIQUE(scope,code_hash)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS quick_action_dispatch (
+  scope TEXT NOT NULL REFERENCES board(scope) ON DELETE CASCADE,
+  code_hash TEXT NOT NULL CHECK(length(code_hash)=64 AND code_hash NOT GLOB '*[^0-9a-f]*'),
+  action_id TEXT NOT NULL REFERENCES quick_action(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL CHECK(revision>=1),
+  PRIMARY KEY(scope,code_hash)
+) STRICT;
+CREATE INDEX IF NOT EXISTS quick_action_dispatch_action ON quick_action_dispatch(action_id);
 CREATE TABLE IF NOT EXISTS board_instructions (
   scope TEXT NOT NULL PRIMARY KEY REFERENCES board(scope),
   revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
@@ -61,6 +78,10 @@ CREATE TABLE IF NOT EXISTS instruction_entry (
   CHECK((removed=1 AND body='') OR (removed=0 AND length(CAST(body AS BLOB)) BETWEEN 1 AND 4096))
 ) STRICT;
 CREATE INDEX IF NOT EXISTS instruction_entry_scope ON instruction_entry(scope,ordinal);
+CREATE TABLE IF NOT EXISTS instruction_timing (
+  entry_id TEXT NOT NULL PRIMARY KEY REFERENCES instruction_entry(id) ON DELETE CASCADE,
+  moments INTEGER NOT NULL CHECK(moments BETWEEN 1 AND 7 AND moments<>2)
+) STRICT;
 CREATE TABLE IF NOT EXISTS instruction_binding (
   entry_id TEXT NOT NULL REFERENCES instruction_entry(id) ON DELETE CASCADE,
   kind TEXT NOT NULL CHECK(kind IN ('chat','global','project')),
@@ -104,6 +125,10 @@ CREATE TABLE IF NOT EXISTS board_stop_checkpoint (
   scope TEXT NOT NULL PRIMARY KEY REFERENCES board(scope) ON DELETE CASCADE,
   fingerprint TEXT NOT NULL CHECK(length(CAST(fingerprint AS BLOB))=64 AND instr(fingerprint,char(0))=0 AND fingerprint NOT GLOB '*[^0-9a-f]*'),
   pass_count INTEGER NOT NULL CHECK(pass_count BETWEEN 1 AND ${MAX_STOP_PASSES})
+) STRICT;
+CREATE TABLE IF NOT EXISTS board_finish_checkpoint (
+  scope TEXT NOT NULL PRIMARY KEY REFERENCES board(scope) ON DELETE CASCADE,
+  turn_id TEXT CHECK(length(CAST(turn_id AS BLOB)) BETWEEN 1 AND 256)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS task (
   ordinal INTEGER PRIMARY KEY,

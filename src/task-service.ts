@@ -7,10 +7,13 @@ import {
 	appendContextText,
 	type BoardFilter,
 	type BoardInstructions,
+	type BoardNote,
+	boardNote,
 	commentBody,
 	commentContent,
 	type InstructionChanges,
 	type InstructionEntryWrite,
+	type InstructionMoment,
 	type InstructionTarget,
 	instructionChanges,
 	instructionEntryWrite,
@@ -105,6 +108,36 @@ export class TaskService {
 		this.store.savePanelView(scope, view);
 	}
 
+	readNote(scope: string): BoardNote {
+		return this.store.readNote(scope);
+	}
+
+	saveNote(scope: string, note: BoardNote): BoardNote {
+		return this.writeNote(scope, note).note;
+	}
+
+	writeNote(scope: string, note: BoardNote): ReturnType<TaskRepository["saveNote"]> {
+		const checked = boardNote.safeParse(note);
+		if (!checked.success) throw new TaskError("invalid_context");
+		return this.store.saveNote(scope, checked.data);
+	}
+
+	appendNote(scope: string, expectedRevision: number, body: string): BoardNote {
+		const current = this.store.readNote(scope);
+		if (current.revision !== expectedRevision) throw new TaskError("conflict");
+		return this.saveNote(scope, {
+			revision: expectedRevision,
+			body: appendContextText(current.body, body),
+		});
+	}
+
+	applyNoteFormat(scope: string, note: BoardNote, formatted: string): void {
+		const checked = boardNote.shape.body.safeParse(formatted);
+		if (checked.success && checked.data.trim() && checked.data !== note.body) {
+			this.store.applyNoteFormat(scope, note, checked.data);
+		}
+	}
+
 	/** Lists the current board without fetching any attachment bytes. */
 	list(
 		scope: string,
@@ -133,9 +166,21 @@ export class TaskService {
 		return this.projects?.list() ?? [];
 	}
 
-	listInstructionEntries(scope: string, presented = false, manageProjects = false): PresentedInstruction[] {
+	listInstructionEntries(
+		scope: string,
+		presented = false,
+		manageProjects = false,
+		moment: InstructionMoment = "turn",
+	): PresentedInstruction[] {
 		const projectId = presented ? undefined : this.projects?.forThread(this.store.threadForScope(scope));
-		return this.store.listInstructionEntries(scope, presented, projectId, manageProjects);
+		return this.store.listInstructionEntries(
+			scope,
+			presented,
+			projectId,
+			manageProjects,
+			false,
+			presented ? undefined : moment,
+		);
 	}
 
 	saveInstructionEntry(
@@ -260,6 +305,14 @@ export class TaskService {
 
 	clearStopCheckpoint(scope: string): void {
 		this.store.clearStopCheckpoint(scope);
+	}
+
+	clearFinishCheckpoint(scope: string): void {
+		this.store.clearFinishCheckpoint(scope);
+	}
+
+	checkpointFinish(scope: string, turnId?: string): boolean {
+		return this.store.checkpointFinish(scope, turnId);
 	}
 
 	checkpointStop(scope: string, continuation: boolean): ReturnType<TaskRepository["checkpointStop"]> {

@@ -1,6 +1,6 @@
 {
 	"name": "session-tasks",
-	"version": "0.6.0",
+	"version": "0.9.1",
 	"description": "A persistent per-chat task queue for Codex Desktop",
 	"scripts": {
 		"typecheck": "tsc --noEmit",

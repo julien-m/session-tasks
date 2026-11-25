@@ -7,7 +7,6 @@ import type { QuickAction, QuickActionInput, QuickActionSuggestion } from "./qui
 import type { TaskRepository } from "./repository.ts";
 
 const MAX_ACTIONS = 200;
-const CODE_TTL_MS = 30_000;
 const digest = (code: string) => createHash("sha256").update(code).digest("hex");
 type ActionRow = Pick<QuickAction, "id" | "revision" | "position" | "title" | "body" | "color"> & {
 	chat_scope: string | null;
@@ -65,6 +64,7 @@ export class QuickActions {
 					SELECT ?,1,COALESCE(MAX(position),0)+1,?,?,?,? FROM quick_action`)
 					.run(id, input.title, input.body, input.color, chatScope);
 			this.db.prepare("DELETE FROM quick_action_project WHERE action_id=?").run(id);
+			this.db.prepare("DELETE FROM quick_action_dispatch WHERE action_id=?").run(id);
 			if (input.audience.kind === "projects") {
 				const insert = this.db.prepare("INSERT INTO quick_action_project VALUES (?,?)");
 				for (const projectId of input.audience.ids) insert.run(id, projectId);
@@ -86,10 +86,14 @@ export class QuickActions {
 		const color = suggestion.color ?? action.color;
 		if (action.title === suggestion.title && action.body === suggestion.body && action.color === color)
 			return;
-		this.db
-			.prepare(`UPDATE quick_action SET revision=revision+1,title=?,body=?,color=?
-				WHERE id=? AND revision=? AND (chat_scope IS NULL OR chat_scope=?)`)
-			.run(suggestion.title, suggestion.body, color, action.id, action.revision, scope);
+		this.tasks.write(() => {
+			const updated = this.db
+				.prepare(`UPDATE quick_action SET revision=revision+1,title=?,body=?,color=?
+					WHERE id=? AND revision=? AND (chat_scope IS NULL OR chat_scope=?)`)
+				.run(suggestion.title, suggestion.body, color, action.id, action.revision, scope);
+			if (updated.changes)
+				this.db.prepare("DELETE FROM quick_action_dispatch WHERE action_id=?").run(action.id);
+		});
 	}
 
 	move(scope: string, id: string, targetId: string, position: number, targetPosition: number): void {
@@ -108,7 +112,7 @@ export class QuickActions {
 		});
 	}
 
-	request(scope: string, id: string, revision: number): string | undefined {
+	request(scope: string, id: string, revision: number): string {
 		return this.tasks.write(() => {
 			const project = this.projects.forThread(this.tasks.threadForScope(scope));
 			const row = this.require(scope, id);
@@ -116,21 +120,27 @@ export class QuickActions {
 			const now = this.now();
 			this.db.prepare("DELETE FROM quick_action_ticket WHERE expires_at<=?").run(now);
 			const code = randomBytes(16).toString("hex");
-			const inserted = this.db
-				.prepare(`INSERT INTO quick_action_ticket VALUES (?,?,?,?,?)
-				ON CONFLICT(scope,action_id) DO NOTHING`)
-				.run(scope, id, digest(code), revision, now + CODE_TTL_MS);
-			return inserted.changes ? code : undefined;
+			this.db
+				.prepare("INSERT INTO quick_action_dispatch VALUES (?,?,?,?)")
+				.run(scope, digest(code), id, revision);
+			return code;
 		});
 	}
 
 	consume(scope: string, code: string): { title: string; body: string } | undefined {
 		return this.tasks.write(() => {
 			const project = this.projects.forThread(this.tasks.threadForScope(scope));
-			const ticket = this.db
-				.prepare(`DELETE FROM quick_action_ticket WHERE scope=? AND code_hash=? AND expires_at>?
-				RETURNING action_id,revision`)
-				.get(scope, digest(code), this.now());
+			const codeHash = digest(code);
+			const ticket =
+				this.db
+					.prepare(
+						"DELETE FROM quick_action_dispatch WHERE scope=? AND code_hash=? RETURNING action_id,revision",
+					)
+					.get(scope, codeHash) ??
+				this.db
+					.prepare(`DELETE FROM quick_action_ticket WHERE scope=? AND code_hash=? AND expires_at>?
+					RETURNING action_id,revision`)
+					.get(scope, codeHash, this.now());
 			if (!ticket || typeof ticket.action_id !== "string") return undefined;
 			const row = this.find(scope, ticket.action_id);
 			if (!row || row.revision !== ticket.revision || !this.present(row, project).available) return undefined;

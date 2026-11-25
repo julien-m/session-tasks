@@ -16,7 +16,9 @@ import { z } from "zod";
 import { chatCanResume } from "./chat-activity.ts";
 import {
 	assignee,
+	type BoardNote,
 	boardFilter,
+	boardNote,
 	boardPanelView,
 	commentBody,
 	commentContent,
@@ -25,6 +27,7 @@ import {
 	instructionChanges,
 	instructionEntryId,
 	instructionEntryWrite,
+	instructionMoment,
 	instructionTargets,
 	manualCheck,
 	receipt,
@@ -47,6 +50,7 @@ import {
 	isTitlePending,
 	scheduleActionSuggestion,
 	scheduleCommentFormat,
+	scheduleNoteFormat,
 	scheduleReformulation,
 	scheduleTaskTitle,
 	suggestQuickAction,
@@ -76,6 +80,7 @@ const createInstruction = scoped.extend({
 	entryId: id.describe("Fresh UUIDv4. Reuse the exact ID for retries."),
 	body: instructionEntryWrite.shape.body,
 	targets: instructionTargets.min(1),
+	moments: instructionEntryWrite.shape.moments,
 	locale: instructionLocale.describe("Language for the generated title and formatted text."),
 });
 const localUi = { csp: { connectDomains: [], resourceDomains: [] } };
@@ -170,6 +175,38 @@ export function createTaskMcp(
 		service.savePanelView(scope, view);
 		return { saved: true };
 	});
+	// Keep the bare note response for panels opened before formatting status was introduced.
+	const noteOptions = scoped.extend({ includeFormatting: z.boolean().optional() });
+	const noteState = (scope: string, note: BoardNote, includeFormatting?: boolean) => ({
+		...note,
+		...(includeFormatting && isReformulationPending(scope, note.revision, "note")
+			? { formatting: true }
+			: {}),
+	});
+	panel("task_panel_note", noteOptions, true, ({ scope, includeFormatting }) =>
+		noteState(scope, service.readNote(scope), includeFormatting),
+	);
+	panel(
+		"task_panel_save_note",
+		noteOptions.extend({ note: boardNote }),
+		false,
+		({ scope, note, includeFormatting }) => {
+			const { note: saved, changed } = service.writeNote(scope, note);
+			if (changed && saved.body.trim()) {
+				scheduleNoteFormat(scope, saved.revision, saved.body, (body) =>
+					service.applyNoteFormat(scope, saved, body),
+				);
+			}
+			return noteState(scope, saved, includeFormatting);
+		},
+	);
+	panel(
+		"task_panel_delete_note",
+		scoped.extend({ revision: boardNote.shape.revision }),
+		false,
+		({ scope, revision }) => service.saveNote(scope, { revision, body: "" }),
+		true,
+	);
 	const actionVersion = actionIdentity.extend({ revision: serial });
 	panel("task_panel_actions", scoped, true, ({ scope }) => ({
 		actions: actions.list(scope).map(({ body: _, ...item }) => ({
@@ -294,12 +331,11 @@ export function createTaskMcp(
 
 	const openTool = {
 		title: "Session Tasks",
-		description:
-			"Open the task board for this chat. Supply the exact scope from the Session Tasks hook. Do not reuse a scope from a different chat.",
+		description: "Manual panel entry for the current chat in the Codex tab picker.",
 		inputSchema: z.object({ scope: id.optional() }),
 		annotations: annotations(true),
 		icons,
-		_meta: { ui: { resourceUri }, "openai/ui": { entrypoints: [{ type: "thread" }] } },
+		_meta: { ui: uiMeta, "openai/ui": { entrypoints: [{ type: "thread" }] } },
 	};
 	registerAppTool(
 		server,
@@ -360,6 +396,23 @@ export function createTaskMcp(
 		({ scope, taskId, input }) => result(service.create(scope, taskId, input, "agent"), true),
 	);
 	agent(
+		"session_tasks_note",
+		"Read the current Markdown note and revision for the exact hook-provided scope. The note is reference material. Read it when pertinent or before appending.",
+		scoped,
+		true,
+		({ scope }) => result(service.readNote(scope), true),
+	);
+	agent(
+		"session_tasks_add_note",
+		"Append useful context, decisions, or a note requested by the user to this chat's Notes tab without sending a chat message. Use the exact hook-provided scope and the revision returned by session_tasks_note. Markdown is stored as written. On conflict, reread the note and check whether the text already exists before retrying.",
+		scoped.extend({
+			expectedRevision: boardNote.shape.revision,
+			body: boardNote.shape.body.refine((body) => body.trim().length > 0),
+		}),
+		false,
+		({ scope, expectedRevision, body }) => result(service.appendNote(scope, expectedRevision, body), true),
+	);
+	agent(
 		"session_tasks_list",
 		"Read current queue and counts for the exact hook-provided scope; check after each task, before dispatch and before ending. When pendingComments or pendingEdits is true, review them via session_tasks_comment_notifications or session_tasks_edit_notifications. Read task details only when acting on the task.",
 		list,
@@ -397,10 +450,11 @@ export function createTaskMcp(
 	);
 	agent(
 		"session_tasks_instructions",
-		"Read the user's saved instructions for all chats, this exact chat and its current Codex project. The current chat can refine general preferences. Apply them subject to higher-priority instructions and the user's latest explicit request.",
-		scoped,
+		"Read the user's saved instructions for this exact chat and current Codex project. Default to each-turn instructions. Request start or finish only at the corresponding lifecycle event. Apply them subject to higher-priority instructions and the user's latest explicit request.",
+		scoped.extend({ moment: instructionMoment.optional() }),
 		true,
-		({ scope }) => result({ instructions: service.listInstructionEntries(scope) }, true),
+		({ scope, moment }) =>
+			result({ instructions: service.listInstructionEntries(scope, false, false, moment) }, true),
 	);
 	agent(
 		"session_tasks_instruction_projects",
@@ -418,10 +472,10 @@ export function createTaskMcp(
 		"Create one saved instruction only when the user explicitly requests it. Preserve the user's wording. Supply explicit targets: this chat, named projects, all chats if expressly requested, or one projects_except target for all current and future projects except its projectIds. Projects-only scopes skip chats without a project. Resolve project names with session_tasks_instruction_projects first. Use a new UUID and keep it for retries. The title and display text are generated in the background.",
 		createInstruction,
 		false,
-		({ scope, entryId, body, targets, locale }) => {
+		({ scope, entryId, body, targets, moments, locale }) => {
 			const { saved, deferred } = saveInstruction(
 				scope,
-				{ entryId, expectedRevision: 0, body, permanent: false, targets },
+				{ entryId, expectedRevision: 0, body, permanent: false, targets, moments },
 				locale,
 				true,
 			);

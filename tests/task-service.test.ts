@@ -54,6 +54,76 @@ test("stores panel preferences per chat and reads them back after reopening SQLi
 	expect(() => database.prepare("UPDATE board_panel_view SET filters=9 WHERE scope=?").run(scope)).toThrow();
 });
 
+test("preserves legacy panel preferences, persists Notes by chat and leaves the queue silent", () => {
+	const folder = mkdtempSync(join(tmpdir(), "session-tasks-board-note-"));
+	resources.push(() => rmSync(folder, { recursive: true, force: true }));
+	const path = join(folder, "tasks.sqlite3");
+	const scope = randomUUID();
+	const thread = randomUUID();
+	const old = new DatabaseSync(path);
+	old.exec(SCHEMA.replace("tab BETWEEN 0 AND 3", "tab BETWEEN 0 AND 2"));
+	old.prepare("INSERT INTO board VALUES (?,?)").run(thread, scope);
+	old.prepare("INSERT INTO board_panel_view VALUES (?,?,?,?,?,?)").run(scope, 2, 3, 1, 52, 14);
+	old.close();
+	const { service } = harness(path);
+	const other = service.bind(randomUUID());
+	const view = {
+		tab: 2,
+		filters: ["remaining", "blocked"],
+		instructionHistory: true,
+		cursor: 52,
+		scrollTop: 14,
+	};
+	expect(service.readPanelView(scope)).toEqual(view);
+	service.savePanelView(scope, boardPanelView.parse({ ...view, tab: 3 }));
+	expect(service.readNote(scope)).toEqual({ revision: 0, body: "" });
+	const body = "## Idée\n\n[À relire](https://example.com)\n";
+	const saved = service.saveNote(scope, { revision: 0, body });
+	expect(saved).toEqual({ revision: 1, body });
+	expect(service.saveNote(scope, { revision: 0, body })).toEqual(saved);
+	expect(() => service.saveNote(scope, { revision: 0, body: "Stale draft" })).toThrow("conflict");
+	expect(() => service.saveNote(scope, { revision: 1, body: "unpaired-\ud800" })).toThrow("invalid_context");
+	expect(() => service.saveNote(scope, { revision: 1, body: "é".repeat(32768) })).toThrow("invalid_context");
+	expect(service.readNote(other)).toEqual({ revision: 0, body: "" });
+	expect(service.list(scope).tasks).toEqual([]);
+	expect(service.pendingNotifications(scope)).toEqual({});
+	const hook = (hook_event_name: string) => taskHook(service, { hook_event_name, session_id: thread });
+	expect(hook("Stop")).toEqual({});
+	const turn = JSON.stringify(hook("UserPromptSubmit"));
+	expect(turn).not.toContain("example.com");
+	expect(turn).toContain("session_tasks_add_note");
+	expect(turn).toContain("needs no task registration");
+	expect(JSON.stringify(hook("UserPromptSubmit"))).not.toMatch(/open_session_tasks|Open the panel/u);
+	const reopened = harness(path).service;
+	expect(reopened.readNote(scope)).toEqual(saved);
+	expect(reopened.readPanelView(scope)).toEqual({ ...view, tab: 3 });
+});
+
+test("appends exact agent notes and protects newer edits and deletion from a late reformulation", () => {
+	const { service, scope } = harness();
+	const first = service.writeNote(scope, { revision: 0, body: "idée brute" });
+	expect(first.changed).toBe(true);
+	expect(service.writeNote(scope, { revision: 0, body: first.note.body }).changed).toBe(false);
+	const exact = "## Décision\n\n    garder cet espacement";
+	const appended = service.appendNote(scope, first.note.revision, exact);
+	expect(appended.body).toBe(`${first.note.body}\n\n${exact}`);
+	expect(() => service.appendNote(scope, first.note.revision, exact)).toThrow("conflict");
+	expect(() => service.appendNote(scope, appended.revision, "é".repeat(16384))).toThrow("invalid_context");
+	service.applyNoteFormat(scope, first.note, "Idée brute");
+	expect(service.readNote(scope)).toEqual(appended);
+	const rewritten = service.saveNote(scope, { revision: appended.revision, body: "nouvelle note" });
+	service.applyNoteFormat(scope, rewritten, "Nouvelle note");
+	const formatted = service.readNote(scope);
+	expect(formatted).toEqual({ revision: rewritten.revision + 1, body: "Nouvelle note" });
+	const removed = service.saveNote(scope, { revision: formatted.revision, body: "" });
+	service.applyNoteFormat(scope, formatted, "Ancienne note");
+	expect(service.readNote(scope)).toEqual(removed);
+	expect(removed.body).toBe("");
+	expect(() => service.saveNote(scope, { revision: formatted.revision, body: "stale" })).toThrow("conflict");
+	expect(service.list(scope).tasks).toEqual([]);
+	expect(service.pendingNotifications(scope)).toEqual({});
+});
+
 test("the Stop hook checks newly queued work and unread comments during its continuation, within a fixed budget", () => {
 	const { service } = harness();
 	const chat = randomUUID();
@@ -663,7 +733,7 @@ test("keeps recurring instructions scoped and requests them on every prompt with
 		revision: 2,
 		body: "",
 	});
-	expect(JSON.stringify(taskHook(service, prompt))).toContain("Discard Session Tasks instruction lists");
+	expect(JSON.stringify(taskHook(service, prompt))).toContain("Discard each-turn instruction lists");
 	const permanent = { revision: 0, body: "- Summarize verification." };
 	service.saveInstructions(scope, { permanent });
 	expect(service.readInstructions(another).permanent).toEqual({ ...permanent, revision: 1 });
@@ -719,7 +789,7 @@ test("lists individual instructions including legacy text, and isolates changes 
 	expect(() =>
 		service.saveInstructionEntry(other, { ...first, expectedRevision: 2, permanent: true }),
 	).toThrow("conflict");
-	expect(JSON.stringify(taskHook(service, hook))).toContain("Discard Session Tasks instruction lists");
+	expect(JSON.stringify(taskHook(service, hook))).toContain("Discard each-turn instruction lists");
 	service.saveInstructionEntry(scope, {
 		entryId: "chat",
 		expectedRevision: 1,
@@ -979,6 +1049,47 @@ test("applies a project instruction only to current members, including after a c
 	expect(service.listInstructionEntries(other)[0]?.body).toBe(body);
 	service.removeInstructionEntry(owner, entryId, 2, true);
 	expect(service.listInstructionEntries(other)).toEqual([]);
+});
+
+test("filters instructions by lifecycle event and allows one finish pass per turn", () => {
+	const { service, scope } = harness();
+	const thread = randomUUID();
+	const sessionScope = service.bind(thread);
+	const hook = (name: string, fields?: object) =>
+		taskHook(service, { hook_event_name: name, session_id: thread, ...fields });
+	const regular = { entryId: randomUUID(), expectedRevision: 0, body: "Default behavior.", permanent: false };
+	const timed = { ...regular, entryId: randomUUID(), body: "Check readiness and clean this build." };
+	service.saveInstructionEntry(sessionScope, regular);
+	service.saveInstructionEntry(sessionScope, { ...timed, moments: ["start", "finish"] });
+	const ids = (moment: "start" | "turn" | "finish", board = sessionScope) =>
+		service.listInstructionEntries(board, false, false, moment).map(({ id }) => id);
+	expect(ids("turn")).toEqual([regular.entryId]);
+	expect(ids("start")).toEqual([timed.entryId]);
+	expect(ids("finish")).toEqual([timed.entryId]);
+	expect(ids("finish", scope)).toEqual([]);
+	expect(JSON.stringify(hook("SessionStart", { source: "startup" }))).toContain('moment=\\"start\\"');
+	expect(JSON.stringify(hook("SessionStart", { source: "resume" }))).not.toContain(timed.body);
+	expect(hook("SessionStart", { source: "compact" })).toEqual({});
+	expect(hook("Stop")).toMatchObject({
+		decision: "block",
+		reason: expect.stringContaining('moment="finish"'),
+	});
+	expect(hook("Stop", { stop_hook_active: true })).toEqual({});
+	const firstTurn = randomUUID();
+	const nextTurn = randomUUID();
+	hook("UserPromptSubmit", { turn_id: firstTurn });
+	expect(hook("Stop", { turn_id: firstTurn })).toMatchObject({ decision: "block" });
+	hook("UserPromptSubmit", { turn_id: firstTurn, prompt: "Follow-up in the same turn." });
+	expect(hook("Stop", { turn_id: firstTurn, stop_hook_active: true })).toEqual({});
+	expect(hook("Stop", { turn_id: nextTurn })).toMatchObject({ decision: "block" });
+	hook("UserPromptSubmit");
+	expect(hook("Stop")).toMatchObject({ decision: "block" });
+	service.saveInstructionEntry(sessionScope, { ...timed, expectedRevision: 1, moments: ["turn"] });
+	expect(ids("turn")).toEqual([regular.entryId, timed.entryId]);
+	expect(ids("finish")).toEqual([]);
+	hook("UserPromptSubmit");
+	expect(hook("Stop")).toEqual({});
+	expect(instructionEntryWrite.safeParse({ ...timed, moments: [] }).success).toBe(false);
 });
 
 test("applies an exclusion scope at prompt time and after editing or adding projects", () => {

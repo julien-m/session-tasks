@@ -62,6 +62,17 @@ export function keepsMarkdownLinks(original: string, formatted: string): boolean
 	return before.length === after.length && before.every((url, index) => after[index] === url);
 }
 
+export function keepsMarkdownCode(original: string, formatted: string): boolean {
+	const code = (token: Token): string[] => {
+		if (token.type === "code_inline") return [`inline:${token.content}`];
+		if (token.type === "fence" || token.type === "code_block") return [`block:${token.content}`];
+		return token.children?.flatMap(code) ?? [];
+	};
+	const before = markdown.parse(original, {}).flatMap(code);
+	const after = markdown.parse(formatted, {}).flatMap(code);
+	return before.length === after.length && before.every((value, index) => value === after[index]);
+}
+
 function anchorFor(url: URL, openLink: OpenLink): HTMLAnchorElement {
 	const anchor = document.createElement("a");
 	anchor.href = url.href;

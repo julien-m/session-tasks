@@ -9,13 +9,17 @@ import {
 	type Attachment,
 	type BoardFilter,
 	type BoardInstructions,
+	type BoardNote,
 	type BoardPanelView,
 	commentBody,
 	type InstructionBinding,
 	type InstructionChanges,
 	type InstructionEntry,
 	type InstructionEntryWrite,
+	type InstructionMoment,
 	type InstructionTarget,
+	instructionMoment,
+	instructionMomentFlags,
 	instructionTargetKey,
 	MAX_PAGE,
 	type Mode,
@@ -33,7 +37,7 @@ import {
 	verification,
 } from "./contract.ts";
 import { keepsMarkdownLinks } from "./markdown-view.ts";
-import { MAX_STOP_PASSES, SCHEMA } from "./schema.ts";
+import { BOARD_PANEL_VIEW_SCHEMA, MAX_STOP_PASSES, SCHEMA } from "./schema.ts";
 
 const storedManualCheck = z.object({ userCheck: manualCheck }).strict();
 
@@ -251,6 +255,25 @@ export function openDatabase(path: string): DatabaseSync {
 			throw error;
 		}
 	}
+	if (schemaVersion() < 2) {
+		database.exec("BEGIN IMMEDIATE");
+		try {
+			if (schemaVersion() < 2) {
+				database.exec(`
+					ALTER TABLE board_panel_view RENAME TO board_panel_view_previous;
+					${BOARD_PANEL_VIEW_SCHEMA}
+					INSERT INTO board_panel_view SELECT * FROM board_panel_view_previous;
+					DROP TABLE board_panel_view_previous;
+					PRAGMA user_version=2;
+				`);
+			}
+			database.exec("COMMIT");
+		} catch (error) {
+			database.exec("ROLLBACK");
+			database.close();
+			throw error;
+		}
+	}
 	migrateCommentReformulations(database);
 	return database;
 }
@@ -313,8 +336,52 @@ export class TaskRepository {
 			.run(scope, view.tab, filters, Number(view.instructionHistory), view.cursor, view.scrollTop);
 	}
 
+	readNote(scope: string): BoardNote {
+		this.assertScope(scope);
+		const stored = this.database.prepare("SELECT revision,body FROM board_note WHERE scope=?").get(scope);
+		return (stored as BoardNote | undefined) ?? { revision: 0, body: "" };
+	}
+
+	saveNote(scope: string, note: BoardNote): { note: BoardNote; changed: boolean } {
+		return this.write(() => {
+			const current = this.readNote(scope);
+			if (
+				note.body === current.body &&
+				(note.revision === current.revision || note.revision + 1 === current.revision)
+			)
+				return { note: current, changed: false };
+			if (note.revision !== current.revision) throw new TaskError("conflict");
+			const revision = current.revision + 1;
+			this.database
+				.prepare(`INSERT INTO board_note VALUES (?,?,?)
+				ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,body=excluded.body`)
+				.run(scope, revision, note.body);
+			return { note: { revision, body: note.body }, changed: true };
+		});
+	}
+
+	applyNoteFormat(scope: string, note: BoardNote, formatted: string): void {
+		this.database
+			.prepare("UPDATE board_note SET body=?,revision=revision+1 WHERE scope=? AND revision=? AND body=?")
+			.run(formatted, scope, note.revision, note.body);
+	}
+
 	clearStopCheckpoint(scope: string): void {
 		this.database.prepare("DELETE FROM board_stop_checkpoint WHERE scope=?").run(scope);
+	}
+
+	clearFinishCheckpoint(scope: string): void {
+		this.database.prepare("DELETE FROM board_finish_checkpoint WHERE scope=?").run(scope);
+	}
+
+	checkpointFinish(scope: string, turnId?: string): boolean {
+		return (
+			this.database
+				.prepare(`INSERT INTO board_finish_checkpoint VALUES (?,?)
+				ON CONFLICT(scope) DO UPDATE SET turn_id=excluded.turn_id
+				WHERE excluded.turn_id IS NOT NULL AND board_finish_checkpoint.turn_id IS NOT excluded.turn_id`)
+				.run(scope, turnId ?? null).changes === 1
+		);
 	}
 
 	/** Records the pending board snapshot before asking Codex for another pass. */
@@ -476,6 +543,7 @@ export class TaskRepository {
 		projectId?: string,
 		manageProjects = false,
 		library = false,
+		moment?: InstructionMoment,
 	): PresentedInstruction[] {
 		this.assertScope(scope);
 		const formatColumns = presented ? "f.title,f.body formattedBody" : "NULL title,NULL formattedBody";
@@ -483,17 +551,18 @@ export class TaskRepository {
 			? "LEFT JOIN instruction_reformulation f ON f.entry_id=e.id AND f.revision=e.revision"
 			: "";
 		const rows = this.database
-			.prepare(`SELECT id,revision,body,permanent,projectId,title,formattedBody,createdAt FROM (
-				SELECT 'chat' id,revision,body,0 permanent,NULL projectId,-2 ordinal,NULL title,NULL formattedBody,NULL createdAt
+			.prepare(`SELECT id,revision,body,permanent,projectId,title,formattedBody,createdAt,moments FROM (
+				SELECT 'chat' id,revision,body,0 permanent,NULL projectId,-2 ordinal,NULL title,NULL formattedBody,NULL createdAt,$turn moments
 				FROM board_instructions WHERE scope=$scope AND body!=''
 				UNION ALL
-				SELECT 'permanent',revision,body,1,NULL,-1,NULL,NULL,NULL FROM permanent_instructions WHERE singleton=1 AND body!=''
+				SELECT 'permanent',revision,body,1,NULL,-1,NULL,NULL,NULL,$turn FROM permanent_instructions WHERE singleton=1 AND body!=''
 				UNION ALL
 				SELECT e.id,e.revision,e.body,
 					EXISTS(SELECT 1 FROM instruction_binding b WHERE b.entry_id=e.id AND b.kind='global'),
 					(SELECT MIN(b.target) FROM instruction_binding b WHERE b.entry_id=e.id AND b.kind='project'),
-					e.ordinal,${formatColumns},e.created_at
-				FROM instruction_entry e ${formatJoin} WHERE e.removed=0 AND ($library=1 OR EXISTS (
+					e.ordinal,${formatColumns},e.created_at,COALESCE(timing.moments,$turn)
+				FROM instruction_entry e LEFT JOIN instruction_timing timing ON timing.entry_id=e.id
+				${formatJoin} WHERE e.removed=0 AND ($library=1 OR EXISTS (
 					SELECT 1 FROM instruction_binding b WHERE b.entry_id=e.id AND (
 						b.kind='global' OR (b.kind='chat' AND b.target=$scope) OR
 						(b.kind='project' AND (b.target=$project OR $manageProjects=1))
@@ -506,26 +575,37 @@ export class TaskRepository {
 						))
 					)
 				))
-			) ORDER BY CASE WHEN $library=1 AND createdAt IS NULL THEN 1 ELSE 0 END,
+			) WHERE $moment IS NULL OR (moments & $moment)<>0
+			ORDER BY CASE WHEN $library=1 AND createdAt IS NULL THEN 1 ELSE 0 END,
 				CASE WHEN $library=1 THEN -ordinal ELSE ordinal END`)
 			.all({
 				$scope: scope,
 				$project: projectId ?? null,
 				$library: Number(library),
 				$manageProjects: Number(manageProjects),
+				$turn: instructionMomentFlags.turn,
+				$moment: moment ? instructionMomentFlags[moment] : null,
 			}) as unknown as Array<
-			Omit<InstructionEntry, "permanent" | "projectId" | "createdAt"> & {
+			Omit<InstructionEntry, "permanent" | "projectId" | "createdAt" | "moments"> & {
 				permanent: 0 | 1;
 				projectId: string | null;
 				title: string | null;
 				formattedBody: string | null;
 				createdAt: number | null;
+				moments: number;
 			}
 		>;
-		return rows.map(({ permanent, projectId, title, formattedBody, createdAt, ...entry }) => ({
+		return rows.map(({ permanent, projectId, title, formattedBody, createdAt, moments, ...entry }) => ({
 			...entry,
 			permanent: Boolean(permanent),
 			...(projectId ? { projectId } : {}),
+			...(moments !== instructionMomentFlags.turn
+				? {
+						moments: instructionMoment.options.filter(
+							(value) => (moments & instructionMomentFlags[value]) !== 0,
+						),
+					}
+				: {}),
 			...(library
 				? {
 						bindings: this.instructionBindings(scope, entry.id),
@@ -623,7 +703,8 @@ export class TaskRepository {
 		now = Date.now(),
 	): PresentedInstruction {
 		return this.write(() => {
-			const { entryId, expectedRevision, body, permanent, projectId, targets, replaceTargetsFrom } = input;
+			const { entryId, expectedRevision, body, permanent, projectId, targets, replaceTargetsFrom, moments } =
+				input;
 			const current = this.listInstructionEntries(scope, true, undefined, manageProjects, !!targets).find(
 				(entry) => entry.id === entryId,
 			);
@@ -651,12 +732,26 @@ export class TaskRepository {
 			if (requested[0]?.kind === "projects_except" && existing.length !== editable.length)
 				throw new TaskError("conflict");
 			const preserveBindings = !replaceTargetsFrom && (Boolean(targets) || existing.length > 1);
-			const same = current?.body === body && (sameTargets || (preserveBindings && expectedRevision > 0));
+			const toFlags = (values: InstructionMoment[]) =>
+				values.reduce((flags, value) => flags | instructionMomentFlags[value], 0);
+			const priorMoments = current?.moments ? toFlags(current.moments) : instructionMomentFlags.turn;
+			const nextMoments = moments ? toFlags(moments) : priorMoments;
+			const same =
+				current?.body === body &&
+				priorMoments === nextMoments &&
+				(sameTargets || (preserveBindings && expectedRevision > 0));
 			if (expectedRevision === 0 && current && same) return current;
 			if ((current?.revision ?? 0) !== expectedRevision) throw new TaskError("conflict");
 			if (same && current) return current;
 			const isLegacy = entryId === "chat" || entryId === "permanent";
-			if (isLegacy && !materializeLegacy && !targets && !projectId && current?.permanent === permanent) {
+			if (
+				isLegacy &&
+				!materializeLegacy &&
+				!targets &&
+				!projectId &&
+				nextMoments === instructionMomentFlags.turn &&
+				current?.permanent === permanent
+			) {
 				this.writeInstructionDocument(scope, entryId, current.revision + 1, body);
 				this.checkInstructionCapacity();
 				return { id: entryId, revision: current.revision + 1, permanent, body };
@@ -689,6 +784,13 @@ export class TaskRepository {
 			}
 			if (!preserveBindings || !current || isLegacy)
 				for (const binding of requested) this.addInstructionBinding(scope, savedId, binding);
+			if (nextMoments !== instructionMomentFlags.turn)
+				this.database
+					.prepare(`INSERT INTO instruction_timing VALUES (?,?)
+					ON CONFLICT(entry_id) DO UPDATE SET moments=excluded.moments`)
+					.run(savedId, nextMoments);
+			else if (priorMoments !== nextMoments)
+				this.database.prepare("DELETE FROM instruction_timing WHERE entry_id=?").run(savedId);
 			this.checkInstructionCapacity();
 			const saved = this.listInstructionEntries(scope, true, undefined, true, true).find(
 				(entry) => entry.id === savedId,
@@ -781,6 +883,7 @@ export class TaskRepository {
 				.run(entryId, expectedRevision);
 			if (!deleted.changes) throw new TaskError("conflict");
 			this.database.prepare("DELETE FROM instruction_reformulation WHERE entry_id=?").run(entryId);
+			this.database.prepare("DELETE FROM instruction_timing WHERE entry_id=?").run(entryId);
 		});
 	}
 

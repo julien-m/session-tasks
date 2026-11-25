@@ -30,6 +30,7 @@ vi.mock("node:child_process", () => ({
 import {
 	isInstructionReformulationFailed,
 	isReformulationPending,
+	scheduleNoteFormat,
 	scheduleReformulation,
 	suggestQuickAction,
 } from "../src/title-suggestion.ts";
@@ -81,6 +82,39 @@ test("reports an invalid model result and clears the failure on retry of the sam
 	expect(isInstructionReformulationFailed(source.id, 1)).toBe(false);
 	completions.shift()?.();
 	await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
+});
+
+test("formats a user's note while preserving its Markdown link destinations", async () => {
+	const scope = "note-board";
+	const source = "[document](https://example.com) à relire";
+	const save = vi.fn();
+	scheduleNoteFormat(scope, 1, source, save);
+	expect(isReformulationPending(scope, 1, "note")).toBe(true);
+	completions.shift()?.("Relire le [document](https://example.org).");
+	await vi.waitFor(() => expect(isReformulationPending(scope, 1, "note")).toBe(false));
+	expect(save).not.toHaveBeenCalled();
+
+	scheduleNoteFormat(scope, 2, source, save);
+	const formatted = "## À relire\n\n- [Document](https://example.com)";
+	completions.shift()?.(formatted);
+	await vi.waitFor(() => expect(save).toHaveBeenCalledWith(formatted));
+	expect(isReformulationPending(scope, 2, "note")).toBe(false);
+});
+
+test("preserves significant indentation and rejects changed Markdown code in a note", async () => {
+	const scope = "note-with-code";
+	const code = "    git status --short\n    git diff --stat\n";
+	const source = `${code}\nà relire`;
+	const save = vi.fn();
+	scheduleNoteFormat(scope, 1, source, save);
+	completions.shift()?.(source.replace("--short", "--long"));
+	await vi.waitFor(() => expect(isReformulationPending(scope, 1, "note")).toBe(false));
+	expect(save).not.toHaveBeenCalled();
+
+	const formatted = `${code}\nÀ relire.`;
+	scheduleNoteFormat(scope, 2, source, save);
+	completions.shift()?.(formatted);
+	await vi.waitFor(() => expect(save).toHaveBeenCalledWith(formatted));
 });
 
 test("supersedes waiting edits and gives tasks a turn even when instructions fill their queue", async () => {

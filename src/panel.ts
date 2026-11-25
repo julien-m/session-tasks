@@ -6,6 +6,7 @@ import {
 	type McpUiHostContext,
 } from "@modelcontextprotocol/ext-apps";
 import manifest from "../plugin.json" with { type: "json" };
+import { installButtonHints } from "./button-hints.ts";
 import {
 	acceptsContext,
 	captureContext,
@@ -18,19 +19,25 @@ import {
 import {
 	type Attachment,
 	appendContextText,
+	type BoardNote,
 	type BoardPanelView,
 	boardInstructionsBody,
+	boardNote,
+	boardNotePanel,
 	boardPanelView,
 	byteLength,
 	commentContent,
 	type InstructionBinding,
 	type InstructionEntryWrite,
+	type InstructionMoment,
 	type InstructionProject,
 	type InstructionTarget,
 	id,
 	instructionEntryWrite,
+	instructionMoment,
 	instructionTargetKey,
 	MAX_BOARD_INSTRUCTIONS_BYTES,
+	MAX_BOARD_NOTE_BYTES,
 	MAX_COMMENT_BYTES,
 	MAX_INSTRUCTION_TARGETS,
 	MAX_PAGE,
@@ -263,7 +270,6 @@ detailFooter.hidden = true;
 dialog.append(dialogContent, detailFooter);
 const add = button("+", () => showEditor(), "icon-button");
 add.setAttribute("aria-label", t.add);
-add.title = t.add;
 add.disabled = true;
 const quickAdd = element("form", undefined, "quick-add");
 const quickTitle = element("input");
@@ -361,18 +367,17 @@ for (const [control, label] of [
 	[previous, t.previous],
 	[more, t.more],
 ] as const) {
-	control.title = label;
 	control.setAttribute("aria-label", label);
 	control.hidden = true;
 }
 const resume = button(t.resume, () => void resumeChat(), "resume-action");
 resume.dataset.testid = "resume-tasks";
+resume.dataset.hint = t.resume;
 const resumeIcon = element("span", "▷");
 resumeIcon.setAttribute("aria-hidden", "true");
 resume.prepend(resumeIcon);
 resume.hidden = true;
 const jumpToLatest = button("↓", () => void refresh(true, true), "icon-button");
-jumpToLatest.title = t.latestTasks;
 jumpToLatest.setAttribute("aria-label", t.latestTasks);
 jumpToLatest.disabled = true;
 const listNavigation = group(previous, more, jumpToLatest);
@@ -401,13 +406,14 @@ const boardHeader = element("header", undefined, "board-header");
 const taskTab = button(t.heading, () => selectBoardTab(0));
 const instructionTab = button(t.instructions, () => selectBoardTab(1));
 const actionsTab = button(t.quickActions, () => selectBoardTab(2));
-const tabs = [taskTab, instructionTab, actionsTab];
+const notesTab = button(t.notes, () => selectBoardTab(3));
+const tabs = [taskTab, instructionTab, actionsTab, notesTab];
 const tabList = group(...tabs);
 tabList.classList.add("board-tabs");
 tabList.setAttribute("role", "tablist");
 tabList.setAttribute("aria-label", t.boardViews);
 for (const [index, tab] of tabs.entries()) {
-	tab.id = ["tab-tasks", "tab-instructions", "tab-actions"][index] ?? "";
+	tab.id = ["tab-tasks", "tab-instructions", "tab-actions", "tab-notes"][index] ?? "";
 	tab.setAttribute("role", "tab");
 	tab.setAttribute("aria-selected", String(index === 0));
 	tab.tabIndex = index === 0 ? 0 : -1;
@@ -434,10 +440,12 @@ boardFooter.append(filterBar, element("small", `v${manifest.version}`, "meta"), 
 const taskPanel = element("section", undefined, "board-tab-panel");
 const instructionPanel = element("section", undefined, "board-tab-panel");
 const actionsPanel = element("section", undefined, "board-tab-panel");
+const notesPanel = element("section", undefined, "board-tab-panel");
 const boardPanels = [
 	[taskPanel, taskTab],
 	[instructionPanel, instructionTab],
 	[actionsPanel, actionsTab],
+	[notesPanel, notesTab],
 ] as const;
 for (const [panel, tab] of boardPanels) {
 	panel.setAttribute("role", "tabpanel");
@@ -463,7 +471,6 @@ const instructionAdd = button(
 );
 instructionAdd.disabled = true;
 instructionAdd.setAttribute("aria-label", t.addInstruction);
-instructionAdd.title = t.addInstruction;
 const instructionQuickForm = element("form", undefined, "quick-add");
 const quickInstruction = element("input");
 quickInstruction.setAttribute("aria-label", t.quickInstruction);
@@ -517,6 +524,7 @@ taskPanel.append(boardList, boardFooter);
 instructionPanel.append(instructionViews, instructionScroll, instructionFooter);
 instructionPanel.hidden = true;
 actionsPanel.hidden = true;
+notesPanel.hidden = true;
 const actionShelf = element("aside", undefined, "action-shelf");
 actionShelf.setAttribute("aria-label", t.runActions);
 actionShelf.hidden = true;
@@ -531,9 +539,58 @@ const actionAdd = button(t.addQuickAction, () => showActionEditor());
 actionAdd.disabled = true;
 const actionAddRow = group(actionAdd);
 actionsPanel.append(actionList, actionLibraryFeedback, actionAddRow);
+const noteScroll = element("div", undefined, "board-list");
+const noteReading = element("div", undefined, "instruction-reading note-reading");
+const notePreview = element("div", undefined, "note-preview");
+const noteNotice = element("p", undefined, "notice");
+noteNotice.setAttribute("role", "status");
+const noteFormatting = element("p", t.noteFormatting, "notice");
+noteFormatting.hidden = true;
+noteFormatting.setAttribute("role", "status");
+const noteEdit = button("✎", () => setNoteEditing(true), "icon-button");
+const noteCreate = noteIcon("task", () => openTaskFromNote(false));
+const noteDelete = noteIcon("delete", confirmNoteDeletion);
+const noteAdd = button(t.noteAdd, () => setNoteEditing(true));
+noteEdit.setAttribute("aria-label", t.noteEdit);
+noteCreate.setAttribute("aria-label", t.noteCreateTask);
+noteDelete.setAttribute("aria-label", t.noteDelete);
+const noteReadingActions = group(noteAdd, noteEdit, noteCreate, noteDelete);
+noteReadingActions.classList.add("note-actions");
+const noteReadingHeader = group(noteFormatting, noteReadingActions);
+noteReadingHeader.classList.add("note-reading-header");
+noteReading.append(noteReadingHeader, notePreview);
+const noteEditor = element("form", undefined, "note-editor");
+const noteInput = element("textarea");
+noteInput.id = "board-note-text";
+noteInput.maxLength = MAX_BOARD_NOTE_BYTES;
+noteInput.rows = 8;
+const noteLabel = element("label", t.noteContent);
+noteLabel.id = "board-note-label";
+noteLabel.htmlFor = noteInput.id;
+noteEditor.setAttribute("aria-labelledby", noteLabel.id);
+const noteHelp = element("p", t.noteHelp, "instruction-hint");
+noteHelp.id = "board-note-help";
+noteInput.setAttribute("aria-describedby", noteHelp.id);
+const noteCancel = button(t.cancelInstructionEdit, () => {
+	setNoteEditing(false);
+	noteNotice.textContent = "";
+	void refreshNote();
+});
+const noteSave = taskSubmit(t.save, "primary");
+const noteDraftCreate = noteIcon("task", () => openTaskFromNote(true));
+noteDraftCreate.setAttribute("aria-label", t.noteCreateTask);
+const noteEditorActions = group(noteDraftCreate, noteCancel, noteSave);
+noteEditorActions.classList.add("note-actions");
+noteEditor.append(noteLabel, noteInput, noteHelp, noteEditorActions);
+noteEditor.hidden = true;
+noteScroll.append(noteReading, noteEditor, noteNotice);
+const noteFooter = element("footer", undefined, "board-footer");
+const noteVersion = element("small", `v${manifest.version}`, "meta");
+noteFooter.append(noteVersion);
+notesPanel.append(noteScroll, noteFooter);
 const boardSurface = element("div", undefined, "board-surface");
-boardSurface.append(taskPanel, instructionPanel, actionsPanel);
-const actionShelfAnchors = [addRow, instructionAddRow, actionAddRow];
+boardSurface.append(taskPanel, instructionPanel, actionsPanel, notesPanel);
+const actionShelfAnchors = [addRow, instructionAddRow, actionAddRow, noteVersion];
 function placeActionShelf(): void {
 	const selected = boardPanels.findIndex(([panel]) => !panel.hidden);
 	const anchor = actionShelfAnchors[selected];
@@ -546,6 +603,7 @@ placeActionShelf();
 main.append(boardHeader, boardSurface);
 document.documentElement.lang = locale;
 document.body.append(main, dialog);
+installButtonHints(t.buttonUnavailable);
 
 let selectedFilters: BoardPanelView["filters"] = [];
 let refreshDiscussion: (() => Promise<void>) | undefined;
@@ -554,7 +612,7 @@ let cursor = 0;
 let previousAfter: number | null = null;
 let lastAgentOrdinal: number | undefined;
 const pageHistory: number[] = [];
-const panelScrollViews = [boardList, instructionScroll, actionList];
+const panelScrollViews = [boardList, instructionScroll, actionList, noteScroll];
 let viewReady = false;
 let viewWritable = false;
 let viewBindingGeneration = 0;
@@ -662,7 +720,8 @@ function moveTask(source: PanelTask, target: PanelTask): void {
 function taskReorderHandle(task: PanelTask, row: HTMLLIElement, controls: HTMLDivElement): HTMLButtonElement {
 	const grip = element("button", "⠿", "icon-button reorder-handle");
 	grip.type = "button";
-	grip.title = t.reorderHint;
+	grip.dataset.hint = t.reorderHint;
+	grip.setAttribute("aria-description", t.reorderHint);
 	grip.setAttribute("aria-label", `${t.reorderTask} · ${task.title}`);
 	grip.setAttribute("aria-keyshortcuts", "ArrowUp ArrowDown");
 
@@ -753,9 +812,7 @@ function taskReorderHandle(task: PanelTask, row: HTMLLIElement, controls: HTMLDi
 	};
 	const up = button("↑", () => move(-1), "icon-button move-up");
 	const down = button("↓", () => move(1), "icon-button move-down");
-	up.title = t.moveUp;
 	up.setAttribute("aria-label", t.moveUp);
-	down.title = t.moveDown;
 	down.setAttribute("aria-label", t.moveDown);
 	up.disabled = !neighbor(-1);
 	down.disabled = !neighbor(1);
@@ -892,6 +949,7 @@ function render(counts: BoardList["counts"], pendingUpdates: boolean): void {
 	previous.disabled = !hasPreviousPage;
 	waitingTitle.textContent = `${t.waitingTasks} · ${counts.queued}`;
 	reorder.disabled = counts.queued < 2;
+	reorder.dataset.disabledHint = t.reorderUnavailable;
 	reorderHint.textContent = reorder.disabled && current.length ? t.reorderUnavailable : "";
 	resume.hidden = (counts.queued === 0 && !pendingUpdates) || !app.getHostCapabilities()?.message?.text;
 	cancelledFilter.hidden = counts.cancelled === 0;
@@ -989,7 +1047,7 @@ function renderTask(task: PanelTask): HTMLLIElement {
 	status.dataset.state = task.state;
 	if (task.state === "done") {
 		status.setAttribute("aria-label", `${t.reopen} · ${task.title}`);
-		status.title = t.reopen;
+		status.dataset.hint = t.reopen;
 	} else status.setAttribute("aria-hidden", "true");
 	const label = t[task.state === "cancelled" ? "cancelledState" : task.state];
 	const title = button(task.title, () => void fetchDetails(task.id), "task-title");
@@ -1005,7 +1063,7 @@ function renderTask(task: PanelTask): HTMLLIElement {
 	if (task.state === "queued") {
 		const grip = taskReorderHandle(task, row, controls);
 		grip.disabled = current.filter((entry) => entry.state === "queued").length < 2;
-		if (grip.disabled) grip.title = t.reorderUnavailable;
+		grip.dataset.disabledHint = t.reorderUnavailable;
 		line.append(grip);
 	}
 	summary.append(line);
@@ -1114,6 +1172,10 @@ function instructionBadges(entry: PresentedInstruction): HTMLDivElement {
 	for (const binding of entry.bindings ?? [])
 		badges.append(element("span", instructionBindingName(binding), "meta"));
 	if (!badges.hasChildNodes()) badges.append(element("span", t.instructionUnassigned, "meta"));
+	if (entry.moments)
+		badges.append(
+			element("span", entry.moments.map((value) => t.instructionMoments[value]).join(" · "), "meta"),
+		);
 	return badges;
 }
 
@@ -1166,14 +1228,182 @@ function selectBoardTab(selected: number, restoring = false): void {
 	if (selected === 0) void refresh(true);
 	if (selected === 1) void refreshInstructionProjects().then(refreshInstructions);
 	if (selected === 2) void refreshActions();
+	if (selected === 3) void refreshNote();
 }
+
+let currentNote: BoardNote | undefined;
+let noteRequest = 0;
+let displayedNote = "";
+let noteReadInFlight = false;
+
+function noteIcon(kind: "task" | "delete", action: () => void): HTMLButtonElement {
+	const control = button("", action, `icon-button note-icon note-icon-${kind}`);
+	const namespace = "http://www.w3.org/2000/svg";
+	const svg = document.createElementNS(namespace, "svg");
+	svg.setAttribute("viewBox", "0 0 16 16");
+	svg.setAttribute("aria-hidden", "true");
+	const path = document.createElementNS(namespace, "path");
+	path.setAttribute(
+		"d",
+		kind === "task"
+			? "M9 13H2.5v-10H12V7 M4.5 8l2 2 3-4 M10 11.5h5 M12.5 9v5"
+			: "M2.5 4.5h11 M6 4.5v-2h4v2 M4 4.5l.8 9h6.4l.8-9 M6.5 7.5v3.5 M9.5 7.5v3.5",
+	);
+	svg.append(path);
+	control.append(svg);
+	return control;
+}
+
+function renderNote(): void {
+	const body = currentNote?.body ?? "";
+	const hasBody = Boolean(body.trim());
+	notePreview.replaceChildren(hasBody ? markdownBlock(body) : element("p", t.noteEmpty, "meta"));
+	notePreview.classList.toggle("note-editable", hasBody);
+	noteAdd.hidden = hasBody;
+	noteReading.classList.toggle("note-has-body", hasBody);
+	noteAdd.disabled = currentNote === undefined;
+	for (const control of [noteEdit, noteCreate, noteDelete]) control.hidden = !hasBody;
+}
+
+notePreview.onclick = (event) => {
+	if (!(event.target instanceof Element) || event.target.closest("a") || !currentNote?.body.trim()) return;
+	if (document.getSelection()?.isCollapsed === false) return;
+	setNoteEditing(true);
+};
+
+function setNoteEditing(editing: boolean): void {
+	if (editing && !currentNote) return;
+	noteEditor.hidden = !editing;
+	noteReading.hidden = editing;
+	if (editing) {
+		noteRequest++;
+		noteInput.value = currentNote?.body ?? "";
+		displayedNote = noteInput.value;
+		noteNotice.textContent = "";
+		noteDraftCreate.disabled = !noteInput.value.trim();
+		noteInput.focus();
+	}
+}
+
+async function refreshNote(): Promise<void> {
+	const board = scope;
+	if (!board || notesPanel.hidden || !noteEditor.hidden || noteReadInFlight) return;
+	const request = ++noteRequest;
+	const initial = !currentNote;
+	if (initial) noteNotice.textContent = t.loading;
+	noteReadInFlight = true;
+	try {
+		const { formatting, ...note } = boardNotePanel.parse(await call("note", { includeFormatting: true }));
+		if (request !== noteRequest || scope !== board || !noteEditor.hidden) return;
+		if (note.revision !== currentNote?.revision || initial) {
+			currentNote = note;
+			renderNote();
+			if (initial) restorePanelScroll(3);
+		}
+		noteFormatting.hidden = !formatting;
+		if (noteNotice.textContent === t.loading || noteNotice.textContent === t.error) {
+			noteNotice.textContent = "";
+		}
+	} catch {
+		if (request === noteRequest && scope === board && initial) noteNotice.textContent = t.error;
+	} finally {
+		noteReadInFlight = false;
+	}
+}
+
+function confirmNoteDeletion(): void {
+	const board = scope;
+	const revision = currentNote?.revision;
+	if (!board || revision === undefined) return;
+	dialogHeader(t.noteDeleteTitle);
+	const feedback = element("p", undefined, "notice");
+	feedback.setAttribute("role", "status");
+	const cancel = button(t.cancelInstructionEdit, goBackInPanel);
+	const confirm = button(t.noteDeleteConfirm, () => void remove(), "instruction-delete-confirm");
+	const actions = group(cancel, confirm);
+	actions.classList.add("instruction-actions");
+	dialogContent.append(element("p", t.noteDeleteHelp, "instruction-hint"), feedback, actions);
+	cancel.focus();
+
+	async function remove(): Promise<void> {
+		if (mutation || scope !== board) return;
+		mutation = true;
+		confirm.disabled = true;
+		try {
+			const saved = boardNote.parse(await call("delete_note", { revision }));
+			if (scope !== board) return;
+			noteRequest++;
+			currentNote = saved;
+			noteFormatting.hidden = true;
+			dialog.close();
+			renderNote();
+			showSuccessNotice(noteNotice, t.noteDeleted);
+			noteAdd.focus();
+		} catch (error) {
+			if (scope === board) {
+				feedback.textContent =
+					error instanceof Error && error.message === "conflict" ? t.noteDeleteConflict : t.error;
+			}
+		} finally {
+			confirm.disabled = false;
+			finishMutation();
+		}
+	}
+}
+
+function openTaskFromNote(editing: boolean): void {
+	const draft = editing ? noteInput.value : (currentNote?.body ?? "");
+	const selection =
+		editing && noteInput.selectionStart !== noteInput.selectionEnd
+			? draft.slice(noteInput.selectionStart, noteInput.selectionEnd)
+			: draft;
+	if (selection.trim()) showEditor(undefined, true, selection);
+}
+
+noteInput.oninput = () => {
+	noteDraftCreate.disabled = !noteInput.value.trim();
+};
+noteEditor.onsubmit = async (event) => {
+	event.preventDefault();
+	const board = scope;
+	const generation = viewBindingGeneration;
+	if (!board || !currentNote || mutation) return;
+	const note = boardNote.safeParse({
+		revision: currentNote.revision,
+		body: noteInput.value === displayedNote ? currentNote.body : noteInput.value,
+	});
+	if (!note.success) {
+		noteNotice.textContent = t.noteTooLong;
+		return;
+	}
+	mutation = true;
+	noteEditor.inert = true;
+	try {
+		const { formatting, ...saved } = boardNotePanel.parse(
+			await call("save_note", { note: note.data, includeFormatting: true }),
+		);
+		if (scope !== board || viewBindingGeneration !== generation) return;
+		currentNote = saved;
+		noteFormatting.hidden = !formatting;
+		setNoteEditing(false);
+		renderNote();
+		showSuccessNotice(noteNotice, t.noteSaved);
+		if (!notesPanel.hidden) (saved.body.trim() ? noteEdit : noteAdd).focus();
+	} catch (error) {
+		if (scope === board && viewBindingGeneration === generation)
+			noteNotice.textContent =
+				error instanceof Error && error.message === "conflict" ? t.noteConflict : t.error;
+	} finally {
+		noteEditor.inert = false;
+		finishMutation();
+	}
+};
 
 type ActionSummary = Omit<QuickAction, "body"> & { optimizing?: boolean };
 let actionSignature = "";
 let actionLoading = false;
 let actionProjects: InstructionProject[] = [];
-let actionDispatching = false;
-const recentActions = new Map<string, number>();
+let actionDispatchQueue: Promise<void> = Promise.resolve();
 
 function colorAction(button: HTMLElement, color: string | null): void {
 	if (color) button.style.setProperty("--action-color", color);
@@ -1202,8 +1432,9 @@ async function refreshActions(): Promise<void> {
 		actionButtons.replaceChildren(
 			...available.map((action) => {
 				const control = button("", () => void sendAction(action), "quick-action");
-				control.title = action.optimizing ? `${action.title} · ${t.actionOptimizing}` : action.title;
+				control.dataset.hint = action.optimizing ? `${action.title} · ${t.actionOptimizing}` : action.title;
 				control.disabled = Boolean(action.optimizing);
+				if (action.optimizing) control.dataset.disabledHint = control.dataset.hint;
 				control.dataset.actionFocus = `run-${action.id}`;
 				control.append(element("span", action.title, "quick-action-title"));
 				colorAction(control, action.color);
@@ -1214,7 +1445,8 @@ async function refreshActions(): Promise<void> {
 			...actions.map((action, index) => {
 				const row = element("div", undefined, "group action-library-row");
 				const edit = button(action.title, () => void loadActionEditor(action.id));
-				edit.title = action.title;
+				edit.dataset.hint = `${t.edit} · ${action.title}`;
+				if (action.optimizing) edit.dataset.disabledHint = `${action.title} · ${t.actionOptimizing}`;
 				edit.disabled = Boolean(action.optimizing);
 				edit.dataset.actionFocus = `edit-${action.id}`;
 				colorAction(edit, action.color);
@@ -1270,16 +1502,18 @@ async function refreshActions(): Promise<void> {
 	}
 }
 
-async function sendAction(action: ActionSummary): Promise<void> {
+function sendAction(action: ActionSummary): void {
 	const board = scope;
-	const now = performance.now();
-	if (!board || actionDispatching || now - (recentActions.get(action.id) ?? -1000) < 800) return;
+	if (!board) return;
+	actionDispatchQueue = actionDispatchQueue.then(() => dispatchAction(board, action));
+}
+
+async function dispatchAction(board: string, action: ActionSummary): Promise<void> {
+	if (scope !== board) return;
 	if (!app.getHostCapabilities()?.message?.text) {
 		actionFeedback.textContent = t.actionCannotSend;
 		return;
 	}
-	recentActions.set(action.id, now);
-	actionDispatching = true;
 	actionFeedback.textContent = "";
 	try {
 		const request = await call<{ code?: string }>("request_action", {
@@ -1304,8 +1538,6 @@ async function sendAction(action: ActionSummary): Promise<void> {
 		if (scope === board) showSuccessNotice(actionFeedback, t.actionSent);
 	} catch {
 		if (scope === board) actionFeedback.textContent = t.actionCannotSend;
-	} finally {
-		actionDispatching = false;
 	}
 }
 
@@ -1365,7 +1597,6 @@ function showActionEditor(action?: QuickAction): void {
 			color.value = value ?? "";
 			updateColors();
 		});
-		swatch.title = value ?? t.actionNeutral;
 		swatch.setAttribute("aria-label", value ? `${t.actionColor} ${value}` : t.actionNeutral);
 		colorAction(swatch, value);
 		return [swatch, value] as const;
@@ -1568,6 +1799,13 @@ function showInstructionDetails(entry: PresentedInstruction): void {
 	const body = formatted && keepsMarkdownLinks(entry.body, formatted) ? formatted : entry.body;
 	content.append(element("h3", t.instructionContent), markdownBlock(body));
 	dialogContent.append(instructionBadges(entry), content);
+	const moments = entry.moments ?? ["turn"];
+	const timing = element("section", undefined, "instruction-reading");
+	timing.append(
+		element("h3", t.instructionTiming),
+		element("p", moments.map((value) => t.instructionMoments[value]).join(" · ")),
+	);
+	dialogContent.append(timing);
 	const bindings = element("div", undefined, "instruction-bindings");
 	for (const binding of entry.bindings ?? []) {
 		if (binding.kind === "other_chat") continue;
@@ -1947,8 +2185,38 @@ function showInstructionEditor(entry?: PresentedInstruction, initialContext?: Tr
 	const readDraft = () => (input.value === source.displayed ? source.body : input.value);
 	const save = taskSubmit(t.save, "primary");
 	let importing = false;
+	const timing = element("fieldset", undefined, "instruction-audience instruction-timing");
+	const moments = new Set<InstructionMoment>(entry?.moments ?? ["turn"]);
+	const timingNotice = element("p", t.instructionTimingRequired, "notice");
+	timingNotice.hidden = true;
+	timingNotice.id = "instruction-timing-required";
+	timingNotice.setAttribute("role", "status");
+	const momentFields = element("div", undefined, "instruction-timing-options");
+	timing.append(element("legend", t.instructionTiming), momentFields, timingNotice);
+	timing.setAttribute("aria-describedby", timingNotice.id);
+	for (const value of instructionMoment.options) {
+		const option = element("input");
+		option.type = "checkbox";
+		option.checked = moments.has(value);
+		option.dataset.testid = `instruction-moment-${value}`;
+		const hint = element("span", t.instructionMomentHints[value], "instruction-hint");
+		hint.id = `instruction-moment-hint-${value}`;
+		option.setAttribute("aria-describedby", hint.id);
+		const label = element("label");
+		label.append(option, element("span", t.instructionMoments[value]));
+		const row = element("div", undefined, "instruction-timing-option");
+		row.append(label, hint);
+		momentFields.append(row);
+		option.onchange = () => {
+			if (option.checked) moments.add(value);
+			else moments.delete(value);
+			updateSave();
+		};
+	}
 	const updateSave = () => {
-		save.disabled = importing || form.inert || ((!entry || scopeTouched) && !selection.targets().length);
+		timingNotice.hidden = moments.size > 0;
+		save.disabled =
+			importing || form.inert || !moments.size || ((!entry || scopeTouched) && !selection.targets().length);
 	};
 	const existingTargets = (entry?.bindings ?? []).filter((binding) => binding.kind !== "other_chat");
 	let scopeTouched = false;
@@ -1986,6 +2254,7 @@ function showInstructionEditor(entry?: PresentedInstruction, initialContext?: Tr
 	actions.append(buttons);
 	form.append(textField);
 	form.append(selection.section);
+	form.append(timing);
 	form.append(actions);
 	dialogContent.append(form);
 	selection.fill();
@@ -2072,6 +2341,7 @@ function showInstructionEditor(entry?: PresentedInstruction, initialContext?: Tr
 			body: readDraft(),
 			permanent: false,
 			targets: !entry || scopeEdited ? selected : [],
+			moments: [...moments],
 			...(entry && scopeEdited ? { replaceTargetsFrom: existingTargets } : {}),
 		});
 		if (!checked.success) {
@@ -2799,7 +3069,7 @@ function newTaskId(): string {
 	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function showEditor(task?: Task, focusContext = false): void {
+function showEditor(task?: Task, focusContext = false, initialContext = ""): void {
 	dialogHeader(task ? t.editTask : t.newTask);
 	const form = element("form");
 	form.setAttribute("aria-labelledby", "task-dialog-title");
@@ -2810,7 +3080,7 @@ function showEditor(task?: Task, focusContext = false): void {
 	const body = element("textarea");
 	body.name = "body";
 	body.maxLength = MAX_TASK_BODY_BYTES;
-	body.value = task?.body ?? "";
+	body.value = task?.body ?? initialContext;
 	const initialBody = body.value;
 	const updateTitleHint = () => {
 		title.placeholder = body.value.trim() ? contextTitle({ files: [], text: body.value }, "") : "";
@@ -2862,7 +3132,7 @@ function showEditor(task?: Task, focusContext = false): void {
 		event.preventDefault();
 		if (mutation) return;
 		const board = scope;
-		const details = body.value === initialBody ? (task?.body ?? body.value) : body.value;
+		const details = body.value === initialBody ? (task?.body ?? initialContext) : body.value;
 		const providedTitle = title.value.trim();
 		const files = attachments.selectedFiles();
 		const kept = attachments.keep();
@@ -2926,6 +3196,7 @@ function showEditor(task?: Task, focusContext = false): void {
 			if (scope !== board) return;
 			dialog.close();
 			if (added) {
+				if (!notesPanel.hidden) selectBoardTab(0);
 				transferMessage(t.taskAdded);
 				void revealCreatedTask(added);
 				if (added.wake && app.getHostCapabilities()?.message?.text) void resumeChat("task");
@@ -3224,12 +3495,18 @@ async function connectBoard(binding: string): Promise<void> {
 	actionList.replaceChildren();
 	actionFeedback.textContent = "";
 	actionLibraryFeedback.textContent = "";
-	recentActions.clear();
 	instructionAdd.disabled = true;
 	instructionSignature = "";
 	deferredInstruction = undefined;
 	instructionProjects = [];
 	currentInstructionProject = undefined;
+	noteRequest++;
+	currentNote = undefined;
+	noteFormatting.hidden = true;
+	noteInput.value = "";
+	noteNotice.textContent = "";
+	setNoteEditing(false);
+	renderNote();
 	instructionTab.textContent = t.instructions;
 	quickInstruction.value = "";
 	unsavedInstruction = undefined;
@@ -3279,6 +3556,7 @@ async function connectBoard(binding: string): Promise<void> {
 	void refreshActions();
 	if (!taskPanel.hidden) void refresh(true, !saved);
 	if (!instructionPanel.hidden) void refreshInstructionProjects().then(refreshInstructions);
+	if (!notesPanel.hidden) void refreshNote();
 }
 app.ontoolresult = async (result) => {
 	const binding = id.safeParse(result._meta?.binding);
@@ -3316,6 +3594,7 @@ const timer = window.setInterval(() => {
 	if (dialog.open) void refreshDiscussion?.();
 	else if (!taskPanel.hidden) void refresh();
 	else if (!instructionPanel.hidden) void refreshInstructions();
+	else if (!notesPanel.hidden) void refreshNote();
 }, POLL_MS);
 window.addEventListener(
 	"pagehide",

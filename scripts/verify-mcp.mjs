@@ -40,6 +40,8 @@ try {
 	assert.ok(Array.isArray(projects.structuredContent.projects));
 	const opener = catalog.tools.find((tool) => tool.name === "open_session_tasks");
 	assert.ok(opener?._meta.ui.resourceUri);
+	assert.deepEqual(opener._meta.ui.visibility, ["app"]);
+	assert.deepEqual(opener._meta["openai/ui"].entrypoints, [{ type: "thread" }]);
 	assert.match(opener.icons?.[0]?.src ?? "", /^data:image\/png;base64,/);
 	const { version } = await (await fetch(new URL("/health", endpoint))).json();
 	assert.equal(opener._meta.ui.resourceUri, `ui://session-tasks/tasks-${version}.html`);
@@ -72,7 +74,7 @@ try {
 	assert.deepEqual(unboundPanel.structuredContent, { binding: null });
 	assert.deepEqual((await success("task_panel_view", {})).structuredContent, { view: null });
 	const panelView = {
-		tab: 2,
+		tab: 3,
 		filters: ["remaining", "blocked"],
 		instructionHistory: true,
 		cursor: 0,

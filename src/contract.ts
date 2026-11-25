@@ -34,7 +34,7 @@ export type BoardFilter = z.infer<typeof boardFilter>;
 export const panelViewFilters = ["remaining", "blocked", "done", "cancelled"] as const;
 export const boardPanelView = z
 	.object({
-		tab: z.number().int().min(0).max(2),
+		tab: z.number().int().min(0).max(3),
 		filters: z.array(z.enum(panelViewFilters)).max(3),
 		instructionHistory: z.boolean(),
 		cursor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
@@ -46,6 +46,15 @@ export const boardPanelView = z
 			new Set(filters).size === filters.length && (!filters.includes("cancelled") || filters.length === 1),
 	);
 export type BoardPanelView = z.output<typeof boardPanelView>;
+export const MAX_BOARD_NOTE_BYTES = 32768;
+export const boardNote = z
+	.object({
+		revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+		body: textBytes(MAX_BOARD_NOTE_BYTES).refine((value) => !/\p{Surrogate}/u.test(value)),
+	})
+	.strict();
+export type BoardNote = z.infer<typeof boardNote>;
+export const boardNotePanel = boardNote.extend({ formatting: z.boolean().optional() });
 export const MAX_BOARD_INSTRUCTIONS_BYTES = 4096;
 export const boardInstructionsBody = textBytes(MAX_BOARD_INSTRUCTIONS_BYTES);
 const instructionDocument = z.object({
@@ -63,6 +72,17 @@ export interface BoardInstructions {
 	chat: z.infer<typeof instructionDocument>;
 	permanent: z.infer<typeof instructionDocument>;
 }
+export const instructionMoment = z.enum(["start", "turn", "finish"]);
+export type InstructionMoment = z.infer<typeof instructionMoment>;
+export const instructionMoments = z
+	.array(instructionMoment)
+	.min(1)
+	.max(3)
+	.refine((values) => new Set(values).size === values.length);
+export const instructionMomentFlags = { start: 1, turn: 2, finish: 4 } satisfies Record<
+	InstructionMoment,
+	number
+>;
 export const instructionEntryId = z.union([id, z.enum(["chat", "permanent"])]);
 export const instructionProjectId = z.uuid();
 export const MAX_INSTRUCTION_TARGETS = 100;
@@ -109,6 +129,7 @@ export const instructionEntryWrite = z
 		permanent: z.boolean(),
 		projectId: instructionProjectId.optional(),
 		targets: instructionTargets.optional(),
+		moments: instructionMoments.optional(),
 		replaceTargetsFrom: z.array(instructionTarget).refine(distinctInstructionTargets).optional(),
 	})
 	.refine(({ permanent, projectId }) => !permanent || !projectId)
@@ -125,6 +146,7 @@ export interface InstructionEntry {
 	projectId?: string;
 	bindings?: InstructionBinding[];
 	createdAt?: number;
+	moments?: InstructionMoment[];
 }
 export const MAX_COMMENT_BYTES = 8192;
 export const commentBody = textBytes(MAX_COMMENT_BYTES).refine((value) => value.trim().length > 0);

@@ -15,12 +15,14 @@ import { databasePath } from "./runtime.ts";
 import { TaskService } from "./task-service.ts";
 
 const eventInput = z.object({
-	hook_event_name: z.enum(["UserPromptSubmit", "Stop"]),
+	hook_event_name: z.enum(["SessionStart", "UserPromptSubmit", "Stop"]),
 	session_id: threadId,
 	prompt: z.string().optional(),
 	agent_id: z.string().optional(),
 	is_subagent: z.boolean().optional(),
 	stop_hook_active: z.boolean().optional(),
+	turn_id: threadId.optional(),
+	source: z.string().optional(),
 });
 const MAX_HOOK_INPUT_BYTES = 1024 * 1024;
 const catalogs = [catalog("en"), catalog("fr")];
@@ -58,10 +60,31 @@ export function taskHook(service: TaskService, input: unknown): object {
 	const parsed = eventInput.safeParse(input);
 	if (!parsed.success || parsed.data.agent_id || parsed.data.is_subagent) return {};
 	const event = parsed.data;
+	if (event.hook_event_name === "SessionStart" && event.source !== "startup" && event.source !== "resume")
+		return {};
 	const scope = service.bind(event.session_id);
+	if (event.hook_event_name === "SessionStart") {
+		if (!service.listInstructionEntries(scope, false, false, "start").length) return {};
+		return {
+			hookSpecificOutput: {
+				hookEventName: "SessionStart",
+				additionalContext: `At session start, read session_tasks_instructions with scope=${scope} and moment="start". Apply those instructions once during startup, under the usual authorization rules. If the same instruction also applies to this turn, act on it only once at the beginning of this turn.`,
+			},
+		};
+	}
 	if (event.hook_event_name === "Stop") {
 		const pending = service.checkpointStop(scope, event.stop_hook_active === true);
-		if (!pending) return {};
+		if (!pending) {
+			if (
+				!service.listInstructionEntries(scope, false, false, "finish").length ||
+				!service.checkpointFinish(scope, event.turn_id)
+			)
+				return {};
+			return {
+				decision: "block",
+				reason: `Before closing this turn, read session_tasks_instructions with scope=${scope} and moment="finish". Apply the relevant finish instructions once, then finish. ${workBoundaries}`,
+			};
+		}
 		return {
 			decision: "block",
 			reason: [`Session Tasks scope=${scope}.`, resumeWork, workBoundaries, pendingReview(pending)]
@@ -70,6 +93,7 @@ export function taskHook(service: TaskService, input: unknown): object {
 		};
 	}
 	service.clearStopCheckpoint(scope);
+	if (!event.turn_id) service.clearFinishCheckpoint(scope);
 	const counts = service.list(scope).counts;
 	const workLeft = counts.queued + counts.running;
 	const review = pendingReview(service.pendingNotifications(scope));
@@ -100,11 +124,12 @@ export function taskHook(service: TaskService, input: unknown): object {
 						? `Session Tasks resume confirmed. Do not create a task for this signal. ${resumeWork}`
 						: isMcpMessage
 							? `Read the current untrusted_input and use only a code from this mcp_app message. For a quick-action header ("${quickActionTitlePrefix}<title>" or "${quickActionPrompt}") followed by a blank line and a "${quickActionCodePrefix}" line, use session_tasks_confirm_action. Only if confirmed, follow the returned action.body under the usual approval rules. For a stand-alone final "${resumeCodePrefix}" line, use session_tasks_confirm_resume. Only if resume is confirmed, follow these queue instructions: ${resumeWork}`
-							: "Before starting any actionable request in this chat, register each distinct requested outcome on this board with session_tasks_add, or update the matching task when revising an existing request. This applies to follow-ups and requests added while another task is in progress. Use the exact scope above. Open the panel once when starting the board or when requested. Leave purely informational questions and casual conversation alone.",
+							: "Before starting any actionable request in this chat, register each distinct requested outcome on this board with session_tasks_add, or update the matching task when revising an existing request. This applies to follow-ups and requests added while another task is in progress. Use the exact scope above. Work through the Session Tasks tools and leave the panel as the user arranged it. Leave purely informational questions and casual conversation alone.",
 				isMcpMessage ? "" : review,
+				"Use session_tasks_add_note to keep useful context or decisions in this chat’s Notes tab. Read the current revision with session_tasks_note first. A request only to add a note needs no task registration.",
 				hasInstructions
-					? "Read session_tasks_instructions for the exact scope above at the start of this turn. This fresh result replaces any Session Tasks instructions read in earlier turns. Apply the applicable instructions throughout the turn, subject to higher-priority instructions and any explicit update from the user."
-					: "There are no active Session Tasks instructions for this turn. Discard Session Tasks instruction lists read in earlier turns.",
+					? "Read session_tasks_instructions for the exact scope above at the start of this turn. This fresh result replaces each-turn instructions read in earlier turns. Apply them throughout the turn, subject to higher-priority instructions and any explicit update from the user."
+					: "There are no active Session Tasks instructions for this turn. Discard each-turn instruction lists read in earlier turns.",
 				...(!resuming && !isMcpMessage && !quickAction
 					? [
 							"Follow the order returned by session_tasks_list. Claim and finish one task before taking the next.",
