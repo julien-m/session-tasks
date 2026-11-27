@@ -47,6 +47,7 @@ import {
 	type PresentedInstruction,
 	type Reformulation,
 	type Revision,
+	resumeCode,
 	resumeCodePrefix,
 	type Task,
 	type TaskComment,
@@ -55,13 +56,7 @@ import {
 } from "./contract.ts";
 import { keepsMarkdownLinks, renderLinkableText, renderMarkdown } from "./markdown-view.ts";
 import { catalog } from "./messages.ts";
-import {
-	type QuickAction,
-	quickActionCodePrefix,
-	quickActionColors,
-	quickActionInput,
-	quickActionTitlePrefix,
-} from "./quick-actions-contract.ts";
+import { type QuickAction, quickActionColors, quickActionInput } from "./quick-actions-contract.ts";
 import type { BoardList, CommentsPage } from "./repository.ts";
 
 const locale = /^fr(?:-|$)/i.test(navigator.language) ? "fr" : "en";
@@ -1528,39 +1523,42 @@ async function refreshActions(): Promise<void> {
 function sendAction(action: ActionSummary): void {
 	const board = scope;
 	if (!board) return;
-	actionDispatchQueue = actionDispatchQueue.then(() => dispatchAction(board, action));
+	const generation = viewBindingGeneration;
+	actionDispatchQueue = actionDispatchQueue.then(() => dispatchAction(board, generation, action));
 }
 
-async function dispatchAction(board: string, action: ActionSummary): Promise<void> {
-	if (scope !== board) return;
+async function dispatchAction(board: string, generation: number, action: ActionSummary): Promise<void> {
+	if (generation !== viewBindingGeneration) return;
 	if (!app.getHostCapabilities()?.message?.text) {
 		actionFeedback.textContent = t.actionCannotSend;
 		return;
 	}
 	actionFeedback.textContent = "";
+	let code: string | undefined;
+	let mayHaveSent = false;
+	const timeout = { timeout: 10000, maxTotalTimeout: 10000 };
 	try {
-		const request = await call<{ code?: string }>("request_action", {
+		const prepared = await call<{ body: unknown; code: unknown }>("prepare_action_message", {
 			actionId: action.id,
 			revision: action.revision,
 		});
-		if (scope !== board) return;
-		if (!request.code) throw new Error("action_pending");
-		const sent = await app.sendMessage(
-			{
-				role: "user",
-				content: [
-					{
-						type: "text",
-						text: `${quickActionTitlePrefix}${action.title}\n\n${quickActionCodePrefix}${request.code}`,
-					},
-				],
-			},
-			{ timeout: 10000, maxTotalTimeout: 10000 },
-		);
-		if (sent.isError) throw new Error("host_rejected");
-		if (scope === board) showSuccessNotice(actionFeedback, t.actionSent);
+		code = resumeCode.parse(prepared.code);
+		if (generation !== viewBindingGeneration) return;
+		const body = quickActionInput.shape.body.parse(prepared.body);
+		await app.updateModelContext({ structuredContent: { sessionTasksActionCode: code } }, timeout);
+		if (generation !== viewBindingGeneration) return;
+		mayHaveSent = true;
+		const sent = await app.sendMessage({ role: "user", content: [{ type: "text", text: body }] }, timeout);
+		if (sent.isError) {
+			mayHaveSent = false;
+			throw new Error("host_rejected");
+		}
+		if (generation === viewBindingGeneration) showSuccessNotice(actionFeedback, t.actionSent);
 	} catch {
-		if (scope === board) actionFeedback.textContent = t.actionCannotSend;
+		if (generation === viewBindingGeneration) actionFeedback.textContent = t.actionCannotSend;
+	} finally {
+		if (code && !mayHaveSent)
+			await call("revoke_action_message", { scope: board, code }).catch(() => undefined);
 	}
 }
 

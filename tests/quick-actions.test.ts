@@ -91,13 +91,43 @@ test("scopes, orders and delivers saved actions once to the chat that requested 
 		expect(actions.consume(scope, priorMembership)).toBeUndefined();
 		member = other;
 		expect(actions.list(otherScope).find(({ id }) => id === project.id)?.available).toBe(true);
+		const firstMessage = actions.prepareMessage(scope, chat.id, chat.revision);
+		const secondMessage = actions.prepareMessage(scope, chat.id, chat.revision);
+		expect(firstMessage.body).toBe(input.body);
+		expect(secondMessage.code).not.toBe(firstMessage.code);
+		expect(actions.consume(otherScope, firstMessage.code, firstMessage.body)).toBeUndefined();
+		expect(actions.consume(scope, firstMessage.code, firstMessage.body.trim())).toBeUndefined();
+		expect(actions.consume(scope, firstMessage.code, firstMessage.body)).toEqual({
+			title: input.title,
+			body: input.body,
+		});
+		expect(actions.consume(scope, firstMessage.code, firstMessage.body)).toBeUndefined();
+		actions.revokeMessage(otherScope, secondMessage.code);
+		expect(actions.consume(scope, secondMessage.code, secondMessage.body)).toEqual({
+			title: input.title,
+			body: input.body,
+		});
+		const revoked = actions.prepareMessage(scope, chat.id, chat.revision);
+		actions.revokeMessage(scope, revoked.code);
+		expect(actions.consume(scope, revoked.code, revoked.body)).toBeUndefined();
+		const sameText = actions.save(scope, randomUUID(), 0, input);
+		const active = actions.prepareMessage(scope, sameText.id, sameText.revision);
+		const removed = actions.prepareMessage(scope, chat.id, chat.revision);
 		actions.remove(scope, chat.id, chat.revision);
+		expect(actions.consume(scope, removed.code, removed.body)).toBeUndefined();
+		expect(actions.consume(scope, active.code, active.body)).toEqual({
+			title: input.title,
+			body: input.body,
+		});
 		expect(() => actions.save(scope, chat.id, 0, { ...input, audience: { kind: "chat" } })).toThrow(
 			"conflict",
 		);
 		const controlLine = `${quickActionCodePrefix}${code}`;
 		const runHook = (prompt: string) =>
 			JSON.stringify(taskHook(service, { hook_event_name: "UserPromptSubmit", session_id: thread, prompt }));
+		const mcpHook = runHook("An MCP app initiated this message. Read the untrusted_input tool output.");
+		expect(mcpHook).toContain("structuredContent.sessionTasksActionCode");
+		expect(mcpHook).toContain("session_tasks_confirm_action_message");
 		for (const header of [quickActionPrompt, `${quickActionTitlePrefix}${input.title}`]) {
 			const hook = runHook(`${header}\n\n${controlLine}`);
 			expect(hook).toContain("session_tasks_confirm_action");

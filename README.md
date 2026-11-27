@@ -28,7 +28,7 @@ In **When to apply**, select one or more moments. **Each turn** is the default f
 
 Use **Actions** to save a reusable prompt. Enter the text, choose its scope and optionally set a title and a palette or hex color. Saving closes the editor. Codex then generates a title and formats the text into paragraphs while preserving the executable wording. If no color is set, Codex can choose one of the 15 palette colors. If optimization fails, the saved text is used. The default makes the action available across chats. You can restrict it to this chat or to selected projects. Use the arrows in the library to change the order. The shortcuts stay available in every tab, in a two-column grid near the bottom of narrow panels. The grid shows up to three rows and scrolls vertically when more actions are available. Short panels leave one or two rows visible.
 
-Clicking a shortcut sends it to the chat that owns the open panel. The host carries a one-time code for that chat and the assistant retrieves the saved text once. You can also ask Codex to create an action without running it.
+Clicking a shortcut sends it to the chat that owns the open panel. The message contains only the saved action text. Session Tasks verifies the exact text and the click’s receipt, carried separately in the app context, before applying it. You can also ask Codex to create an action without running it.
 
 ## Host integration
 
@@ -48,7 +48,7 @@ During a turn, add entries directly in the panel. Codex rereads the queue betwee
 
 Each panel resume request includes a one-time code for that chat. The generic MCP message envelope leaves the code available for the actual Session Tasks message. Codes expire after 30 seconds.
 
-Quick action clicks use separate one-time codes bound to the chat and the saved action revision. Each click sends its own message in order. Quick action codes remain valid while the messages wait for Codex. Editing or removing an action invalidates earlier codes for that action.
+Each quick action click sends a separate message, tied to the chat and the saved action revision. Clicks remain valid while messages wait for Codex. Editing or removing an action invalidates its earlier pending clicks.
 
 Posting a user comment from the panel notifies its owning chat. The first unread comment can wake an idle chat. Later comments are grouped with it. During a turn, Codex checks for comments between tasks and before ending. If the automatic wake was unavailable, use **Resume**. Codex reads the comment on its task and acknowledges it after review. The notification persists until acknowledged and carries no comment text in the chat message.
 
@@ -73,4 +73,4 @@ The quick-add field, full editor button, and completion progress stay at the bot
 Session Tasks remembers the selected tab, task filters and current list position separately for each chat. Reopening or refreshing the panel restores that view.
 
 Quick actions stay at the bottom of every tab. The grid fits up to two, three or four actions per row, according to the panel width, and scrolls vertically when more rows are available.
-Clicking a quick action sends its title to the chat above the one-use action code. When tasks or updates are waiting, **Resume** appears beside the task filters with a play icon and its own accent.
+Clicking a quick action sends its saved text to the chat. When tasks or updates are waiting, **Resume** appears beside the task filters with a play icon and its own accent.

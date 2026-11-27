@@ -278,6 +278,28 @@ export function createTaskMcp(
 			? undefined
 			: actions.request(scope, actionId, revision),
 	}));
+	panel("task_panel_prepare_action_message", actionVersion, false, ({ scope, actionId, revision }) => {
+		if (isReformulationPending(actionId, revision, "action")) throw new TaskError("conflict");
+		return actions.prepareMessage(scope, actionId, revision);
+	});
+	panel("task_panel_revoke_action_message", scoped.extend({ code: resumeCode }), false, ({ scope, code }) => {
+		actions.revokeMessage(scope, code);
+		return { revoked: true };
+	});
+	server.registerTool(
+		"session_tasks_confirm_action_message",
+		{
+			description:
+				"Confirm one click with the code from the model context attached to the current app message and its exact visible text. Never use a code from earlier messages or from the visible text. The host chat binding takes precedence; otherwise use the current hook scope. Apply the returned action only if confirmed.",
+			inputSchema: z.object({ scope: id.optional(), body: quickActionBody, code: resumeCode }),
+			annotations: annotations(false),
+		},
+		protection(({ scope, body, code }, context) => {
+			const binding = desktopBinding(context) ?? scope;
+			const action = binding ? actions.consume(binding, code, body) : undefined;
+			return result(action ? { confirmed: true, action } : { confirmed: false }, true);
+		}),
+	);
 	agent(
 		"session_tasks_add_action",
 		"Save a quick action only when the user explicitly requests creation. Supply a short title and the exact text to send; preserve commands, branches and intent. Specify global, this chat, or explicitly named project IDs resolved by session_tasks_instruction_projects. Saving never runs the action.",

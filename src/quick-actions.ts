@@ -113,6 +113,10 @@ export class QuickActions {
 	}
 
 	request(scope: string, id: string, revision: number): string {
+		return this.prepareMessage(scope, id, revision).code;
+	}
+
+	prepareMessage(scope: string, id: string, revision: number): { body: string; code: string } {
 		return this.tasks.write(() => {
 			const project = this.projects.forThread(this.tasks.threadForScope(scope));
 			const row = this.require(scope, id);
@@ -123,14 +127,30 @@ export class QuickActions {
 			this.db
 				.prepare("INSERT INTO quick_action_dispatch VALUES (?,?,?,?)")
 				.run(scope, digest(code), id, revision);
-			return code;
+			return { body: row.body, code };
 		});
 	}
 
-	consume(scope: string, code: string): { title: string; body: string } | undefined {
+	revokeMessage(scope: string, code: string): void {
+		this.tasks.assertScope(scope);
+		this.db
+			.prepare("DELETE FROM quick_action_dispatch WHERE scope=? AND code_hash=?")
+			.run(scope, digest(code));
+	}
+
+	consume(scope: string, code: string, expectedBody?: string): { title: string; body: string } | undefined {
 		return this.tasks.write(() => {
 			const project = this.projects.forThread(this.tasks.threadForScope(scope));
 			const codeHash = digest(code);
+			if (
+				expectedBody !== undefined &&
+				!this.db
+					.prepare(`SELECT 1 FROM quick_action_dispatch dispatch
+					JOIN quick_action action ON action.id=dispatch.action_id
+					WHERE dispatch.scope=? AND dispatch.code_hash=? AND dispatch.revision=action.revision AND action.body=?`)
+					.get(scope, codeHash, expectedBody)
+			)
+				return undefined;
 			const ticket =
 				this.db
 					.prepare(

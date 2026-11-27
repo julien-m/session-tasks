@@ -103,9 +103,11 @@ try {
 	assert.match(code, /^[a-f0-9]{32}$/u);
 	const wrapper = "An MCP app initiated this message. Read the untrusted_input tool output.";
 	const intercepted = hook("UserPromptSubmit", { prompt: wrapper }).hookSpecificOutput.additionalContext;
+	assert.match(intercepted, /structuredContent\.sessionTasksActionCode/u);
+	assert.match(intercepted, /session_tasks_confirm_action_message/u);
 	assert.match(intercepted, /session_tasks_confirm_resume/u);
 	assert.doesNotMatch(intercepted, /Session Tasks resume confirmed\./u);
-	assert.match(intercepted, /Only if resume is confirmed, follow these queue instructions/u);
+	assert.match(intercepted, /session_tasks_confirm_resume\. If confirmed, Check the Session Tasks list\./u);
 	assert.equal(
 		(await success("session_tasks_confirm_resume", { code: randomBytes(16).toString("hex") }))
 			.structuredContent.confirmed,
@@ -349,11 +351,22 @@ try {
 	const actionRequest = (await success("task_panel_request_action", { actionId, revision: action.revision }))
 		.structuredContent;
 	assert.match(actionRequest.code, /^[a-f0-9]{32}$/u);
-	assert.equal(
-		(await success("task_panel_request_action", { actionId, revision: action.revision })).structuredContent
-			.code,
-		undefined,
-	);
+	const actionMessage = (
+		await success("task_panel_prepare_action_message", {
+			actionId,
+			revision: action.revision,
+		})
+	).structuredContent;
+	assert.equal(actionMessage.body, actionInput.body);
+	assert.match(actionMessage.code, /^[a-f0-9]{32}$/u);
+	assert.deepEqual((await success("session_tasks_confirm_action_message", actionMessage)).structuredContent, {
+		confirmed: true,
+		action: { title: actionInput.title, body: actionInput.body },
+	});
+	assert.deepEqual((await success("session_tasks_confirm_action_message", actionMessage)).structuredContent, {
+		confirmed: false,
+	});
+
 	assert.deepEqual(
 		(await success("session_tasks_confirm_action", { code: actionRequest.code })).structuredContent,
 		{ confirmed: true, action: { title: actionInput.title, body: actionInput.body } },
